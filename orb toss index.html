@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tech Hub VR — Orb Toss</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #060b18; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: flex-end; pointer-events: none;
+    font-family: "Segoe UI", system-ui, sans-serif; color: #cfe8ef;
+    padding-bottom: 42px; gap: 12px; text-align: center;
+  }
+  #hud h1 { font-size: 20px; font-weight: 600; letter-spacing: 0.12em;
+    text-transform: uppercase; margin: 0; color: #7fd4e0; }
+  #hud p { margin: 0; font-size: 12.5px; opacity: 0.75; max-width: 520px; line-height: 1.55; }
+  #enterVR {
+    pointer-events: auto; cursor: pointer; border: 1px solid #2ea3b5;
+    background: rgba(10, 30, 45, 0.85); color: #9fe8f2; font-size: 15px;
+    letter-spacing: 0.08em; padding: 14px 34px; border-radius: 999px;
+    transition: background 0.2s, transform 0.2s;
+  }
+  #enterVR:hover { background: rgba(20, 60, 80, 0.95); transform: translateY(-2px); }
+  #enterVR:disabled { opacity: 0.4; cursor: default; transform: none; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>Technology Hub &middot; Orb Toss</h1>
+  <p id="hint">Grab orbs (trigger/grip, or pinch with bare hands) and throw them through the glowing ring to score.
+     Left stick: aim + release to teleport &middot; Right stick: snap turn &middot; A: reset orbs &middot; B: reset score.
+     Desktop preview: drag to look around.</p>
+  <button id="enterVR" disabled>Checking VR&hellip;</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  // ---------- Renderer, scene, camera ----------
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x060b18);
+  scene.fog = new THREE.Fog(0x060b18, 8, 30);
+
+  const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 100);
+  camera.position.set(0, 1.6, 3);
+
+  const rig = new THREE.Group();
+  rig.add(camera);
+  scene.add(rig);
+
+  // ---------- Audio (synthesised, no assets) ----------
+  let audioCtx = null, masterGain = null;
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.18;
+      masterGain.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
+  function tone(freq, dur, type, vol, slideTo, delay) {
+    if (!audioCtx) return;
+    const t0 = audioCtx.currentTime + (delay || 0);
+    const o = audioCtx.createOscillator(), gn = audioCtx.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+    gn.gain.setValueAtTime(vol || 0.4, t0);
+    gn.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    o.connect(gn); gn.connect(masterGain);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }
+  window.addEventListener('pointerdown', ensureAudio, { once: false });
+
+  // ---------- Lighting ----------
+  scene.add(new THREE.HemisphereLight(0x88bfd6, 0x0a1226, 0.55));
+  const key = new THREE.PointLight(0x4fd6e8, 1.1, 18);
+  key.position.set(0, 4, 0);
+  scene.add(key);
+  const warm = new THREE.PointLight(0x3b6fd6, 0.6, 14);
+  warm.position.set(-4, 2, -4);
+  scene.add(warm);
+
+  // ---------- Environment: grid platform + stars ----------
+  const floorGeo = new THREE.CircleGeometry(9, 64);
+  floorGeo.rotateX(-Math.PI / 2);
+  const floor = new THREE.Mesh(
+    floorGeo,
+    new THREE.MeshStandardMaterial({ color: 0x0b1a30, roughness: 0.85, metalness: 0.2 })
+  );
+  scene.add(floor);
+
+  const grid = new THREE.GridHelper(18, 36, 0x2ea3b5, 0x123047);
+  grid.position.y = 0.002;
+  grid.material.transparent = true;
+  grid.material.opacity = 0.55;
+  scene.add(grid);
+
+  const ringGeo = new THREE.RingGeometry(8.85, 9, 96);
+  ringGeo.rotateX(-Math.PI / 2);
+  const edgeRing = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0x4fd6e8 }));
+  edgeRing.position.y = 0.004;
+  scene.add(edgeRing);
+
+  const starCount = 1200;
+  const starPos = new Float32Array(starCount * 3);
+  for (let i = 0; i < starCount; i++) {
+    const r = 30 + Math.random() * 30;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    starPos[i * 3]     = r * Math.sin(phi) * Math.cos(theta);
+    starPos[i * 3 + 1] = Math.abs(r * Math.cos(phi)) * 0.7 + 1;
+    starPos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+  }
+  const starGeo = new THREE.BufferGeometry();
+  starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+  scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({
+    color: 0xa8d8e8, size: 0.06, sizeAttenuation: true, transparent: true, opacity: 0.85
+  })));
+
+  // ---------- Grabbable objects ----------
+  const grabbables = [];
+  const palette = [0x4fd6e8, 0x7fe0b0, 0x6f8ff0, 0xe8c76f, 0xe07fb0, 0x9f7fe0];
+  const shapes = [
+    () => new THREE.IcosahedronGeometry(0.14, 0),
+    () => new THREE.OctahedronGeometry(0.15, 0),
+    () => new THREE.DodecahedronGeometry(0.13, 0),
+    () => new THREE.TorusKnotGeometry(0.09, 0.032, 64, 8),
+    () => new THREE.BoxGeometry(0.2, 0.2, 0.2),
+    () => new THREE.ConeGeometry(0.12, 0.24, 6)
+  ];
+
+  for (let i = 0; i < 10; i++) {
+    const color = palette[i % palette.length];
+    const mesh = new THREE.Mesh(
+      shapes[i % shapes.length](),
+      new THREE.MeshStandardMaterial({
+        color, roughness: 0.3, metalness: 0.45,
+        emissive: color, emissiveIntensity: 0.28
+      })
+    );
+    const angle = (i / 10) * Math.PI * 2;
+    const radius = 1.0 + (i % 3) * 0.45;
+    mesh.position.set(Math.cos(angle) * radius, 1.1 + (i % 4) * 0.28, Math.sin(angle) * radius - 0.5);
+    mesh.userData = {
+      grabbable: true,
+      home: mesh.position.clone(),
+      velocity: new THREE.Vector3(),
+      free: false,
+      heldBy: null,
+      prevHoopZ: null,
+      bobPhase: Math.random() * Math.PI * 2,
+      spin: new THREE.Vector3((Math.random() - 0.5), (Math.random() - 0.5), (Math.random() - 0.5)).multiplyScalar(0.8),
+      baseEmissive: 0.28
+    };
+    scene.add(mesh);
+    grabbables.push(mesh);
+  }
+
+  // ---------- Scoring hoop ----------
+  const hoop = new THREE.Mesh(
+    new THREE.TorusGeometry(0.35, 0.035, 16, 48),
+    new THREE.MeshStandardMaterial({
+      color: 0x7fe0b0, emissive: 0x7fe0b0, emissiveIntensity: 0.6,
+      roughness: 0.35, metalness: 0.3
+    })
+  );
+  scene.add(hoop);
+  let hoopBaseY = 1.6;
+
+  function placeHoop() {
+    const a = Math.random() * Math.PI * 2;
+    const r = 2.2 + Math.random() * 2.0;
+    hoopBaseY = 1.2 + Math.random() * 1.1;
+    hoop.position.set(Math.cos(a) * r, hoopBaseY, Math.sin(a) * r);
+    hoop.lookAt(0, hoopBaseY, 0);
+    hoop.updateMatrixWorld(true);
+    for (const g of grabbables) g.userData.prevHoopZ = null;
+  }
+
+  // ---------- Scoreboard (canvas texture) ----------
+  let score = 0, best = 0;
+  const boardCanvas = document.createElement('canvas');
+  boardCanvas.width = 512; boardCanvas.height = 256;
+  const bctx = boardCanvas.getContext('2d');
+  const boardTex = new THREE.CanvasTexture(boardCanvas);
+  const board = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.5, 0.75),
+    new THREE.MeshBasicMaterial({ map: boardTex, transparent: true, side: THREE.DoubleSide })
+  );
+  board.position.set(0, 2.5, -4.2);
+  scene.add(board);
+
+  function drawBoard() {
+    bctx.clearRect(0, 0, 512, 256);
+    bctx.fillStyle = 'rgba(8, 20, 38, 0.88)';
+    bctx.fillRect(0, 0, 512, 256);
+    bctx.strokeStyle = '#2ea3b5';
+    bctx.lineWidth = 6;
+    bctx.strokeRect(3, 3, 506, 250);
+    bctx.textAlign = 'center';
+    bctx.fillStyle = '#7fd4e0';
+    bctx.font = '600 30px "Segoe UI", sans-serif';
+    bctx.fillText('O R B   T O S S', 256, 52);
+    bctx.fillStyle = '#e8f8fb';
+    bctx.font = '700 110px "Segoe UI", sans-serif';
+    bctx.fillText(String(score), 256, 168);
+    bctx.fillStyle = '#9fb8c8';
+    bctx.font = '500 26px "Segoe UI", sans-serif';
+    bctx.fillText('BEST  ' + best, 256, 222);
+    boardTex.needsUpdate = true;
+  }
+
+  // ---------- Score particle burst ----------
+  const PCOUNT = 80, BURST_DUR = 0.9;
+  const burstGeo = new THREE.BufferGeometry();
+  const burstPos = new Float32Array(PCOUNT * 3);
+  burstGeo.setAttribute('position', new THREE.BufferAttribute(burstPos, 3));
+  const burstMat = new THREE.PointsMaterial({
+    size: 0.035, transparent: true, opacity: 0, color: 0x7fe0b0, depthWrite: false
+  });
+  const burstPoints = new THREE.Points(burstGeo, burstMat);
+  burstPoints.frustumCulled = false;
+  scene.add(burstPoints);
+  const burstVel = [];
+  for (let i = 0; i < PCOUNT; i++) burstVel.push(new THREE.Vector3());
+  let burstLife = 0;
+
+  function spawnBurst(center, colorHex) {
+    burstMat.color.set(colorHex);
+    for (let i = 0; i < PCOUNT; i++) {
+      burstPos[i * 3] = center.x; burstPos[i * 3 + 1] = center.y; burstPos[i * 3 + 2] = center.z;
+      burstVel[i].set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+        .normalize().multiplyScalar(1.2 + Math.random() * 1.8);
+    }
+    burstGeo.attributes.position.needsUpdate = true;
+    burstLife = BURST_DUR;
+    burstMat.opacity = 1;
+  }
+
+  function onScore(g) {
+    score++;
+    if (score > best) best = score;
+    drawBoard();
+    spawnBurst(hoop.position.clone(), g.material.color.getHex());
+    ensureAudio();
+    tone(660, 0.12, 'sine', 0.35);
+    tone(880, 0.14, 'sine', 0.35, null, 0.09);
+    tone(1320, 0.2, 'sine', 0.3, null, 0.18);
+    for (const c of controllers) pulse(c, 0.8, 120);
+    placeHoop();
+  }
+
+  // ---------- Controllers ----------
+  const raycaster = new THREE.Raycaster();
+  const tmpMatrix = new THREE.Matrix4();
+  const controllers = [];
+
+  function makeControllerVisual() {
+    const group = new THREE.Group();
+    const tip = new THREE.Mesh(
+      new THREE.SphereGeometry(0.02, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0x9fe8f2 })
+    );
+    group.add(tip);
+    const rayGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)
+    ]);
+    const line = new THREE.Line(rayGeo, new THREE.LineBasicMaterial({
+      color: 0x4fd6e8, transparent: true, opacity: 0.6
+    }));
+    line.scale.z = 4;
+    line.name = 'ray';
+    group.add(line);
+    return group;
+  }
+
+  function pulse(ctrl, intensity, ms) {
+    const src = ctrl.userData.inputSource;
+    if (src && src.gamepad && src.gamepad.hapticActuators && src.gamepad.hapticActuators[0]) {
+      src.gamepad.hapticActuators[0].pulse(intensity, ms);
+    }
+  }
+
+  function findHover(ctrl) {
+    tmpMatrix.identity().extractRotation(ctrl.matrixWorld);
+    raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+    raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMatrix);
+    const hits = raycaster.intersectObjects(grabbables, false);
+    return hits.length ? hits[0].object : null;
+  }
+
+  function releaseObject(held, throwVelocity) {
+    held.userData.velocity.copy(throwVelocity);
+    held.userData.free = true;
+    held.userData.heldBy = null;
+    held.material.emissiveIntensity = held.userData.baseEmissive;
+    ensureAudio();
+    tone(380, 0.08, 'sine', 0.2, 300);
+  }
+
+  function onGrabStart(ctrl) {
+    ensureAudio();
+    if (ctrl.userData.held) return;
+    let target = findHover(ctrl);
+    if (!target || target.userData.heldBy) {
+      const cpos = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
+      let best2 = null, bestDist = 0.35;
+      for (const g of grabbables) {
+        if (g.userData.heldBy) continue;
+        const d = g.position.distanceTo(cpos);
+        if (d < bestDist) { best2 = g; bestDist = d; }
+      }
+      target = best2;
+    }
+    if (!target || target.userData.heldBy) return;
+    target.userData.heldBy = ctrl;
+    ctrl.userData.held = target;
+    target.userData.free = false;
+    target.userData.velocity.set(0, 0, 0);
+    target.userData.prevHoopZ = null;
+    target.material.emissiveIntensity = 0.8;
+    pulse(ctrl, 0.6, 60);
+    tone(440, 0.1, 'sine', 0.3, 620);
+  }
+
+  function onGrabEnd(ctrl) {
+    const held = ctrl.userData.held;
+    if (!held) return;
+    releaseObject(held, ctrl.userData.velocity.clone().multiplyScalar(1.15));
+    ctrl.userData.held = null;
+    pulse(ctrl, 0.3, 40);
+  }
+
+  for (let i = 0; i < 2; i++) {
+    const ctrl = renderer.xr.getController(i);
+    ctrl.userData = {
+      held: null,
+      velocity: new THREE.Vector3(),
+      prevPos: new THREE.Vector3(),
+      inputSource: null
+    };
+    const visual = makeControllerVisual();
+    visual.name = 'visual';
+    ctrl.add(visual);
+    ctrl.addEventListener('selectstart', () => onGrabStart(ctrl));
+    ctrl.addEventListener('selectend',   () => onGrabEnd(ctrl));
+    ctrl.addEventListener('squeezestart', () => onGrabStart(ctrl));
+    ctrl.addEventListener('squeezeend',   () => onGrabEnd(ctrl));
+    ctrl.addEventListener('connected', (e) => {
+      ctrl.userData.inputSource = e.data;
+      visual.visible = !(e.data && e.data.hand);
+    });
+    ctrl.addEventListener('disconnected', () => {
+      ctrl.userData.inputSource = null;
+      visual.visible = false;
+    });
+    rig.add(ctrl);
+    controllers.push(ctrl);
+  }
+
+  // ---------- Hand tracking (raw WebXR joint API) ----------
+  const JOINT_NAMES = [
+    'wrist',
+    'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
+    'index-finger-metacarpal', 'index-finger-phalanx-proximal', 'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip',
+    'middle-finger-metacarpal', 'middle-finger-phalanx-proximal', 'middle-finger-phalanx-intermediate', 'middle-finger-phalanx-distal', 'middle-finger-tip',
+    'ring-finger-metacarpal', 'ring-finger-phalanx-proximal', 'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
+    'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal', 'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'
+  ];
+  const PINCH_START = 0.022;
+  const PINCH_END   = 0.038;
+
+  const jointMat = new THREE.MeshStandardMaterial({
+    color: 0x9fe8f2, roughness: 0.4, metalness: 0.1,
+    emissive: 0x2ea3b5, emissiveIntensity: 0.35
+  });
+  const jointGeo = new THREE.SphereGeometry(0.01, 10, 8);
+
+  function makeHandState() {
+    const group = new THREE.Group();
+    group.visible = false;
+    const jointMeshes = JOINT_NAMES.map(() => {
+      const m = new THREE.Mesh(jointGeo, jointMat);
+      m.visible = false;
+      group.add(m);
+      return m;
+    });
+    rig.add(group);
+    return {
+      group, jointMeshes,
+      pinching: false,
+      held: null,
+      pinchPos: new THREE.Vector3(),
+      prevPinchPos: new THREE.Vector3(),
+      velocity: new THREE.Vector3(),
+      hasPrev: false
+    };
+  }
+  const handStates = { left: makeHandState(), right: makeHandState() };
+
+  function handGrabStart(h) {
+    ensureAudio();
+    if (h.held) return;
+    let best2 = null, bestDist = 0.15;
+    for (const g of grabbables) {
+      if (g.userData.heldBy) continue;
+      const d = g.position.distanceTo(h.pinchPos);
+      if (d < bestDist) { best2 = g; bestDist = d; }
+    }
+    if (!best2) return;
+    best2.userData.heldBy = h;
+    best2.userData.free = false;
+    best2.userData.velocity.set(0, 0, 0);
+    best2.userData.prevHoopZ = null;
+    best2.material.emissiveIntensity = 0.8;
+    h.held = best2;
+    tone(440, 0.1, 'sine', 0.3, 620);
+  }
+
+  function handGrabEnd(h) {
+    if (!h.held) return;
+    releaseObject(h.held, h.velocity.clone().multiplyScalar(1.1));
+    h.held = null;
+  }
+
+  function updateHands(frame, dt) {
+    const session = renderer.xr.getSession();
+    const refSpace = renderer.xr.getReferenceSpace();
+    const seen = { left: false, right: false };
+    if (session && refSpace) {
+      for (const source of session.inputSources) {
+        if (!source.hand || (source.handedness !== 'left' && source.handedness !== 'right')) continue;
+        const h = handStates[source.handedness];
+        seen[source.handedness] = true;
+        h.group.visible = true;
+
+        for (let j = 0; j < JOINT_NAMES.length; j++) {
+          const jointSpace = source.hand.get(JOINT_NAMES[j]);
+          const mesh = h.jointMeshes[j];
+          const pose = jointSpace ? frame.getJointPose(jointSpace, refSpace) : null;
+          if (pose) {
+            mesh.visible = true;
+            mesh.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
+            const r = (pose.radius && pose.radius > 0) ? pose.radius : 0.008;
+            mesh.scale.setScalar(r / 0.01);
+          } else {
+            mesh.visible = false;
+          }
+        }
+
+        const thumbPose = frame.getJointPose(source.hand.get('thumb-tip'), refSpace);
+        const indexPose = frame.getJointPose(source.hand.get('index-finger-tip'), refSpace);
+        if (thumbPose && indexPose) {
+          const tp = thumbPose.transform.position, ip = indexPose.transform.position;
+          h.pinchPos.set((tp.x + ip.x) / 2, (tp.y + ip.y) / 2, (tp.z + ip.z) / 2);
+          rig.localToWorld(h.pinchPos); // joint poses are rig-local; game logic is world-space
+          const dist = Math.hypot(tp.x - ip.x, tp.y - ip.y, tp.z - ip.z);
+
+          if (h.hasPrev && dt > 0) {
+            const v = h.pinchPos.clone().sub(h.prevPinchPos).divideScalar(dt);
+            h.velocity.lerp(v, 0.5);
+          }
+          h.prevPinchPos.copy(h.pinchPos);
+          h.hasPrev = true;
+
+          if (!h.pinching && dist < PINCH_START) {
+            h.pinching = true;
+            handGrabStart(h);
+          } else if (h.pinching && dist > PINCH_END) {
+            h.pinching = false;
+            handGrabEnd(h);
+          }
+
+          if (h.held) h.held.position.copy(h.pinchPos);
+        }
+      }
+    }
+    for (const side of ['left', 'right']) {
+      if (!seen[side]) {
+        const h = handStates[side];
+        if (h.group.visible) {
+          h.group.visible = false;
+          h.hasPrev = false;
+          if (h.pinching) { h.pinching = false; handGrabEnd(h); }
+        }
+      }
+    }
+  }
+
+  // ---------- Locomotion: teleport (left stick) + snap turn (right stick) ----------
+  const ARC_POINTS = 40;
+  const arcGeo = new THREE.BufferGeometry();
+  const arcPos = new Float32Array(ARC_POINTS * 3);
+  arcGeo.setAttribute('position', new THREE.BufferAttribute(arcPos, 3));
+  const arcLine = new THREE.Line(arcGeo, new THREE.LineBasicMaterial({
+    color: 0x9fe8f2, transparent: true, opacity: 0.9
+  }));
+  arcLine.visible = false;
+  arcLine.frustumCulled = false;
+  scene.add(arcLine);
+
+  const markerGeo = new THREE.RingGeometry(0.15, 0.22, 32);
+  markerGeo.rotateX(-Math.PI / 2);
+  const marker = new THREE.Mesh(markerGeo, new THREE.MeshBasicMaterial({
+    color: 0x7fe0b0, transparent: true, opacity: 0.9, side: THREE.DoubleSide
+  }));
+  marker.visible = false;
+  scene.add(marker);
+
+  const teleport = { aiming: false, valid: false, target: new THREE.Vector3() };
+  let snapReady = true, aReady = true, bReady = true;
+
+  function updateArc(ctrl) {
+    const origin = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
+    tmpMatrix.identity().extractRotation(ctrl.matrixWorld);
+    const v = new THREE.Vector3(0, 0, -1).applyMatrix4(tmpMatrix).multiplyScalar(7);
+    const p = new THREE.Vector3();
+    let landed = false;
+    for (let i = 0; i < ARC_POINTS; i++) {
+      const t = i * 0.05;
+      p.set(origin.x + v.x * t, origin.y + v.y * t - 4.9 * t * t, origin.z + v.z * t);
+      if (p.y <= 0 && i > 0) {
+        p.y = 0;
+        landed = true;
+        for (let j = i; j < ARC_POINTS; j++) {
+          arcPos[j * 3] = p.x; arcPos[j * 3 + 1] = 0.01; arcPos[j * 3 + 2] = p.z;
+        }
+        break;
+      }
+      arcPos[i * 3] = p.x; arcPos[i * 3 + 1] = p.y; arcPos[i * 3 + 2] = p.z;
+    }
+    arcGeo.attributes.position.needsUpdate = true;
+    const dist = Math.hypot(p.x, p.z);
+    teleport.valid = landed && dist < 8.5;
+    teleport.target.set(p.x, 0, p.z);
+    arcLine.visible = true;
+    marker.visible = teleport.valid;
+    marker.position.set(p.x, 0.01, p.z);
+  }
+
+  function doTeleport() {
+    const camPos = new THREE.Vector3();
+    camera.getWorldPosition(camPos);
+    rig.position.x += teleport.target.x - camPos.x;
+    rig.position.z += teleport.target.z - camPos.z;
+    rig.updateMatrixWorld(true);
+    handStates.left.hasPrev = handStates.right.hasPrev = false;
+    ensureAudio();
+    tone(500, 0.15, 'sine', 0.25, 220);
+  }
+
+  function snapTurn(angle) {
+    const before = new THREE.Vector3();
+    camera.getWorldPosition(before);
+    rig.rotation.y += angle;
+    rig.updateMatrixWorld(true);
+    const after = new THREE.Vector3();
+    camera.getWorldPosition(after);
+    rig.position.add(before.sub(after));
+    rig.position.y = 0;
+    rig.updateMatrixWorld(true);
+    handStates.left.hasPrev = handStates.right.hasPrev = false;
+    ensureAudio();
+    tone(300, 0.06, 'sine', 0.15, 380);
+  }
+
+  function resetOrbs() {
+    for (const g of grabbables) {
+      if (g.userData.heldBy) continue;
+      g.position.copy(g.userData.home);
+      g.userData.free = false;
+      g.userData.velocity.set(0, 0, 0);
+      g.userData.prevHoopZ = null;
+    }
+    ensureAudio();
+    tone(240, 0.12, 'sine', 0.2, 180);
+  }
+
+  function handleLocomotion() {
+    let leftSeen = false;
+    for (const ctrl of controllers) {
+      const src = ctrl.userData.inputSource;
+      if (!src || src.hand || !src.gamepad) continue;
+      const gp = src.gamepad;
+      const ax = gp.axes.length >= 4 ? gp.axes[2] : (gp.axes[0] || 0);
+      const ay = gp.axes.length >= 4 ? gp.axes[3] : (gp.axes[1] || 0);
+
+      if (src.handedness === 'right') {
+        if (snapReady && Math.abs(ax) > 0.7) {
+          snapTurn(ax > 0 ? -Math.PI / 6 : Math.PI / 6);
+          snapReady = false;
+        } else if (Math.abs(ax) < 0.3) {
+          snapReady = true;
+        }
+      }
+
+      if (src.handedness === 'left') {
+        leftSeen = true;
+        if (ay < -0.6) {
+          teleport.aiming = true;
+          updateArc(ctrl);
+        } else if (teleport.aiming) {
+          teleport.aiming = false;
+          if (teleport.valid) doTeleport();
+          arcLine.visible = false;
+          marker.visible = false;
+        }
+      }
+
+      const b = gp.buttons;
+      if (b && b.length > 4 && b[4]) {
+        if (aReady && b[4].pressed) { resetOrbs(); aReady = false; }
+        else if (!b[4].pressed) aReady = true;
+      }
+      if (b && b.length > 5 && b[5]) {
+        if (bReady && b[5].pressed) { score = 0; drawBoard(); bReady = false; }
+        else if (!b[5].pressed) bReady = true;
+      }
+    }
+    if (!leftSeen && teleport.aiming) {
+      teleport.aiming = false;
+      arcLine.visible = false;
+      marker.visible = false;
+    }
+  }
+
+  // ---------- Desktop fallback: drag to look ----------
+  let dragging = false, yaw = 0, pitch = 0, px = 0, py = 0;
+  renderer.domElement.addEventListener('pointerdown', (e) => { dragging = true; px = e.clientX; py = e.clientY; });
+  window.addEventListener('pointerup', () => { dragging = false; });
+  window.addEventListener('pointermove', (e) => {
+    if (!dragging || renderer.xr.isPresenting) return;
+    yaw   -= (e.clientX - px) * 0.004;
+    pitch -= (e.clientY - py) * 0.004;
+    pitch = Math.max(-1.2, Math.min(1.2, pitch));
+    px = e.clientX; py = e.clientY;
+    camera.rotation.set(pitch, yaw, 0, 'YXZ');
+  });
+
+  // ---------- Enter VR button ----------
+  const btn = document.getElementById('enterVR');
+  const hint = document.getElementById('hint');
+  let xrSession = null;
+
+  if (navigator.xr) {
+    navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
+      if (ok) {
+        btn.disabled = false;
+        btn.textContent = 'Enter VR';
+      } else {
+        btn.textContent = 'VR not available';
+        hint.textContent = 'Open this page in the Meta Quest Browser (over HTTPS) to enter VR. Desktop preview: drag to look around.';
+      }
+    });
+  } else {
+    btn.textContent = 'WebXR not supported';
+    hint.textContent = 'Open this page in the Meta Quest Browser (over HTTPS) to enter VR. Desktop preview: drag to look around.';
+  }
+
+  btn.addEventListener('click', () => {
+    ensureAudio();
+    if (xrSession) { xrSession.end(); return; }
+    navigator.xr.requestSession('immersive-vr', {
+      optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
+    }).then((session) => {
+      xrSession = session;
+      btn.textContent = 'Exit VR';
+      session.addEventListener('end', () => { xrSession = null; btn.textContent = 'Enter VR'; });
+      renderer.xr.setSession(session);
+    });
+  });
+
+  // ---------- Animation loop ----------
+  const clock = new THREE.Clock();
+  const GRAVITY = -3.2;
+  const wp = new THREE.Vector3();
+  const localP = new THREE.Vector3();
+
+  placeHoop();
+  drawBoard();
+
+  renderer.setAnimationLoop((time, frame) => {
+    const dt = Math.min(clock.getDelta(), 0.05);
+    const t = clock.elapsedTime;
+
+    // Controllers: velocity tracking + hover highlight + carry
+    for (const ctrl of controllers) {
+      ctrl.getWorldPosition(wp);
+      if (dt > 0) {
+        ctrl.userData.velocity
+          .copy(wp).sub(ctrl.userData.prevPos).divideScalar(dt)
+          .lerp(ctrl.userData.velocity, 0.35);
+      }
+      ctrl.userData.prevPos.copy(wp);
+
+      const isHand = ctrl.userData.inputSource && ctrl.userData.inputSource.hand;
+      const hover = (ctrl.userData.held || isHand) ? null : findHover(ctrl);
+      const visual = ctrl.getObjectByName('visual');
+      const rayLine = visual ? visual.getObjectByName('ray') : null;
+      if (rayLine) rayLine.material.opacity = hover ? 1.0 : 0.5;
+      for (const g of grabbables) {
+        if (!g.userData.heldBy) {
+          g.material.emissiveIntensity +=
+            (((hover === g) ? 0.7 : g.userData.baseEmissive) - g.material.emissiveIntensity) * 0.2;
+        }
+      }
+
+      if (ctrl.userData.held) {
+        ctrl.getWorldPosition(wp);
+        tmpMatrix.identity().extractRotation(ctrl.matrixWorld);
+        const forward = new THREE.Vector3(0, 0, -0.25).applyMatrix4(tmpMatrix);
+        ctrl.userData.held.position.copy(wp).add(forward);
+      }
+    }
+
+    // Hands + locomotion
+    if (frame) updateHands(frame, dt);
+    if (renderer.xr.isPresenting) handleLocomotion();
+
+    // Object motion + hoop scoring
+    for (const g of grabbables) {
+      const u = g.userData;
+      if (u.heldBy) continue;
+
+      if (u.free) {
+        u.velocity.y += GRAVITY * dt;
+        g.position.addScaledVector(u.velocity, dt);
+        if (g.position.y < 0.15) {
+          const impact = Math.abs(u.velocity.y);
+          g.position.y = 0.15;
+          u.velocity.y *= -0.55;
+          u.velocity.x *= 0.8;
+          u.velocity.z *= 0.8;
+          if (impact > 0.6) tone(95 + Math.random() * 40, 0.12, 'triangle', Math.min(0.45, impact * 0.06));
+          if (u.velocity.length() < 0.4) { u.free = false; u.velocity.set(0, 0, 0); }
+        }
+        if (g.position.length() > 8.5) { u.free = false; u.velocity.set(0, 0, 0); }
+        g.rotation.x += u.spin.x * dt * 3;
+        g.rotation.y += u.spin.y * dt * 3;
+
+        // Hoop pass detection (crossing the ring plane within its opening)
+        localP.copy(g.position);
+        hoop.worldToLocal(localP);
+        if (u.prevHoopZ !== null && u.prevHoopZ > 0 && localP.z <= 0 &&
+            Math.sqrt(localP.x * localP.x + localP.y * localP.y) < 0.30) {
+          onScore(g);
+        } else {
+          u.prevHoopZ = localP.z;
+        }
+      } else {
+        u.prevHoopZ = null;
+        const target = u.home.clone();
+        target.y += Math.sin(t * 1.2 + u.bobPhase) * 0.06;
+        g.position.lerp(target, 0.02);
+        g.rotation.x += u.spin.x * dt;
+        g.rotation.y += u.spin.y * dt;
+      }
+    }
+
+    // Particle burst
+    if (burstLife > 0) {
+      burstLife -= dt;
+      for (let i = 0; i < PCOUNT; i++) {
+        burstVel[i].y += GRAVITY * dt * 0.5;
+        burstPos[i * 3]     += burstVel[i].x * dt;
+        burstPos[i * 3 + 1] += burstVel[i].y * dt;
+        burstPos[i * 3 + 2] += burstVel[i].z * dt;
+      }
+      burstGeo.attributes.position.needsUpdate = true;
+      burstMat.opacity = Math.max(0, burstLife / BURST_DUR);
+    }
+
+    // Ambient animation
+    edgeRing.material.color.setHSL(0.52, 0.7, 0.45 + Math.sin(t * 0.8) * 0.1);
+    hoop.material.emissiveIntensity = 0.5 + Math.sin(t * 2.5) * 0.2;
+    hoop.position.y = hoopBaseY + Math.sin(t * 1.4) * 0.05;
+
+    renderer.render(scene, camera);
+  });
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+})();
+</script>
+</body>
+</html>
