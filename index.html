@@ -32,8 +32,8 @@
 <div id="hud">
   <h1>Technology Hub &middot; Orb Toss</h1>
   <p id="hint">Point at an orb (controller or bare-hand ray), pinch or squeeze to pull it to you, throw it through the ring.
-     Streaks multiply points; gold rings score double. Find the glowing pillar and hit START for a 60-second round —
-     the ring starts moving as your score climbs. Mixed Reality mode plays in your real room.
+     Streaks multiply points; gold rings score double; the final 15 seconds of a round is Frenzy time.
+     The glowing pillar has START and EXIT pads — EXIT returns you here to switch between VR and Mixed Reality.
      Left stick: teleport &middot; Right stick: snap turn &middot; A: reset orbs &middot; B: reset scores.</p>
   <div id="btnRow">
     <button id="enterVR" class="xrbtn" disabled>Checking VR&hellip;</button>
@@ -66,9 +66,9 @@
   rig.add(camera);
   scene.add(rig);
 
-  let passthrough = false;   // true while in Mixed Reality (immersive-ar)
+  let passthrough = false;
 
-  // ---------- Audio (synthesised, no assets) ----------
+  // ---------- Audio ----------
   let audioCtx = null, masterGain = null;
   function ensureAudio() {
     if (!audioCtx) {
@@ -95,7 +95,7 @@
   }
   window.addEventListener('pointerdown', ensureAudio);
 
-  // ---------- Motion sampler (windowed velocity for natural throws) ----------
+  // ---------- Motion sampler ----------
   function makeSampler() {
     return {
       buf: [],
@@ -168,17 +168,7 @@
   }));
   scene.add(stars);
 
-  function setPassthrough(on) {
-    passthrough = on;
-    floor.visible = !on;
-    grid.visible = !on;
-    edgeRing.visible = !on;
-    stars.visible = !on;
-    scene.background = on ? null : BG_COLOR;
-    scene.fog = on ? null : FOG;
-  }
-
-  // ---------- Grabbable orbs (with flight trails) ----------
+  // ---------- Grabbable orbs ----------
   const grabbables = [];
   const TRAIL_LEN = 14;
   const palette = [0x4fd6e8, 0x7fe0b0, 0x6f8ff0, 0xe8c76f, 0xe07fb0, 0x9f7fe0];
@@ -248,7 +238,7 @@
     g.userData.trail.geometry.attributes.position.needsUpdate = true;
   }
 
-  // ---------- Scoring hoop (normal + golden, moving in rounds) ----------
+  // ---------- Scoring hoop ----------
   const hoop = new THREE.Mesh(
     new THREE.TorusGeometry(0.35, 0.035, 16, 48),
     new THREE.MeshStandardMaterial({
@@ -290,9 +280,9 @@
   let mode = 'free';
   let freeScore = 0, roundScore = 0, streak = 0;
   let timeLeft = 0, lastTickSecond = -1;
+  let lastRoundScore = 0, finalFlash = 0;
   let bestRound = 0;
   try { bestRound = parseInt(localStorage.getItem('orbtoss_best') || '0', 10) || 0; } catch (e) {}
-
   function saveBest() {
     try { localStorage.setItem('orbtoss_best', String(bestRound)); } catch (e) {}
   }
@@ -309,11 +299,24 @@
   board.position.set(0, 2.5, -4.2);
   scene.add(board);
 
+  function setPassthrough(on) {
+    passthrough = on;
+    floor.visible = !on;
+    grid.visible = !on;
+    edgeRing.visible = !on;
+    stars.visible = !on;
+    scene.background = on ? null : BG_COLOR;
+    scene.fog = on ? null : FOG;
+    // Bring the scoreboard closer indoors so it doesn't sit beyond real walls
+    if (on) board.position.set(0, 2.0, -2.4);
+    else board.position.set(0, 2.5, -4.2);
+  }
+
   function drawBoard() {
     bctx.clearRect(0, 0, 512, 256);
     bctx.fillStyle = 'rgba(8, 20, 38, 0.88)';
     bctx.fillRect(0, 0, 512, 256);
-    bctx.strokeStyle = mode === 'round' ? '#7fe0b0' : '#2ea3b5';
+    bctx.strokeStyle = mode === 'round' ? '#7fe0b0' : (finalFlash > 0 ? '#e8c76f' : '#2ea3b5');
     bctx.lineWidth = 6;
     bctx.strokeRect(3, 3, 506, 250);
     bctx.textAlign = 'center';
@@ -322,12 +325,16 @@
     bctx.fillText('O R B   T O S S', 256, 44);
     bctx.fillStyle = '#e8f8fb';
     bctx.font = '700 100px "Segoe UI", sans-serif';
-    bctx.fillText(String(mode === 'round' ? roundScore : freeScore), 256, 150);
+    const big = mode === 'round' ? roundScore : (finalFlash > 0 ? lastRoundScore : freeScore);
+    bctx.fillText(String(big), 256, 150);
     bctx.font = '600 27px "Segoe UI", sans-serif';
     if (mode === 'round') {
       const s = Math.max(0, Math.ceil(timeLeft));
-      bctx.fillStyle = s <= 5 ? '#e8c76f' : '#9fe8f2';
-      bctx.fillText('TIME  ' + s + 's', 256, 194);
+      bctx.fillStyle = s <= 5 ? '#e8c76f' : (s <= 15 ? '#e07fb0' : '#9fe8f2');
+      bctx.fillText((s <= 15 ? 'FRENZY  \u00B7  ' : 'TIME  ') + s + 's', 256, 194);
+    } else if (finalFlash > 0) {
+      bctx.fillStyle = '#e8c76f';
+      bctx.fillText('TIME UP  \u00B7  FINAL SCORE', 256, 194);
     } else {
       bctx.fillStyle = '#9fb8c8';
       bctx.fillText('FREE PLAY  \u00B7  START PAD = 60s ROUND', 256, 194);
@@ -344,12 +351,12 @@
   const popups = [];
   for (let i = 0; i < 4; i++) {
     const c = document.createElement('canvas');
-    c.width = 128; c.height = 64;
+    c.width = 192; c.height = 64;
     const tex = new THREE.CanvasTexture(c);
     const spr = new THREE.Sprite(new THREE.SpriteMaterial({
       map: tex, transparent: true, opacity: 0, depthWrite: false
     }));
-    spr.scale.set(0.5, 0.25, 1);
+    spr.scale.set(0.6, 0.2, 1);
     scene.add(spr);
     popups.push({ spr, ctx: c.getContext('2d'), tex, life: 0 });
   }
@@ -358,11 +365,11 @@
   function spawnPopup(text, pos, color) {
     const p = popups[popupIdx];
     popupIdx = (popupIdx + 1) % popups.length;
-    p.ctx.clearRect(0, 0, 128, 64);
+    p.ctx.clearRect(0, 0, 192, 64);
     p.ctx.textAlign = 'center';
     p.ctx.fillStyle = color;
-    p.ctx.font = '700 44px "Segoe UI", sans-serif';
-    p.ctx.fillText(text, 64, 46);
+    p.ctx.font = '700 ' + (text.length > 4 ? 34 : 46) + 'px "Segoe UI", sans-serif';
+    p.ctx.fillText(text, 96, 46);
     p.tex.needsUpdate = true;
     p.spr.position.copy(pos);
     p.spr.position.y += 0.3;
@@ -370,30 +377,51 @@
     p.spr.material.opacity = 1;
   }
 
-  // ---------- Start kiosk: pillar + beacon + billboard panel ----------
+  // ---------- Start/Exit kiosk ----------
   const PAD_POS = new THREE.Vector3(1.4, 1.15, -1.0);
 
-  const padCanvas = document.createElement('canvas');
-  padCanvas.width = 256; padCanvas.height = 128;
-  const pctx = padCanvas.getContext('2d');
-  const padTex = new THREE.CanvasTexture(padCanvas);
-
-  function drawPad(label1, label2) {
-    pctx.clearRect(0, 0, 256, 128);
-    pctx.fillStyle = 'rgba(9, 26, 42, 0.95)';
-    pctx.fillRect(0, 0, 256, 128);
-    pctx.strokeStyle = '#7fe0b0';
-    pctx.lineWidth = 5;
-    pctx.strokeRect(3, 3, 250, 122);
-    pctx.textAlign = 'center';
-    pctx.fillStyle = '#7fe0b0';
-    pctx.font = '700 44px "Segoe UI", sans-serif';
-    pctx.fillText(label1, 128, 58);
-    pctx.fillStyle = '#9fe8f2';
-    pctx.font = '600 24px "Segoe UI", sans-serif';
-    pctx.fillText(label2, 128, 98);
-    padTex.needsUpdate = true;
+  function makeLabel(w, h) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    return { canvas: c, ctx: c.getContext('2d'), tex: new THREE.CanvasTexture(c) };
   }
+
+  const padL = makeLabel(256, 128);
+  function drawPad(label1, label2) {
+    const x = padL.ctx;
+    x.clearRect(0, 0, 256, 128);
+    x.fillStyle = 'rgba(9, 26, 42, 0.95)';
+    x.fillRect(0, 0, 256, 128);
+    x.strokeStyle = '#7fe0b0';
+    x.lineWidth = 5;
+    x.strokeRect(3, 3, 250, 122);
+    x.textAlign = 'center';
+    x.fillStyle = '#7fe0b0';
+    x.font = '700 44px "Segoe UI", sans-serif';
+    x.fillText(label1, 128, 58);
+    x.fillStyle = '#9fe8f2';
+    x.font = '600 24px "Segoe UI", sans-serif';
+    x.fillText(label2, 128, 98);
+    padL.tex.needsUpdate = true;
+  }
+
+  const exitL = makeLabel(256, 96);
+  (function drawExit() {
+    const x = exitL.ctx;
+    x.fillStyle = 'rgba(42, 12, 16, 0.95)';
+    x.fillRect(0, 0, 256, 96);
+    x.strokeStyle = '#e07f7f';
+    x.lineWidth = 5;
+    x.strokeRect(3, 3, 250, 90);
+    x.textAlign = 'center';
+    x.fillStyle = '#e89a9a';
+    x.font = '700 40px "Segoe UI", sans-serif';
+    x.fillText('EXIT', 128, 45);
+    x.fillStyle = '#d8b0b0';
+    x.font = '600 20px "Segoe UI", sans-serif';
+    x.fillText('back to menu', 128, 78);
+    exitL.tex.needsUpdate = true;
+  })();
 
   const kiosk = new THREE.Group();
   kiosk.position.set(PAD_POS.x, 0, PAD_POS.z);
@@ -433,10 +461,26 @@
   billboard.add(padBox);
   const padLabel = new THREE.Mesh(
     new THREE.PlaneGeometry(0.6, 0.3),
-    new THREE.MeshBasicMaterial({ map: padTex, transparent: true })
+    new THREE.MeshBasicMaterial({ map: padL.tex, transparent: true })
   );
   padLabel.position.z = 0.045;
   billboard.add(padLabel);
+
+  const exitBox = new THREE.Mesh(
+    new THREE.BoxGeometry(0.46, 0.24, 0.07),
+    new THREE.MeshStandardMaterial({
+      color: 0x241014, emissive: 0xb54848, emissiveIntensity: 0.25,
+      roughness: 0.4, metalness: 0.3
+    })
+  );
+  exitBox.position.y = -0.42;
+  billboard.add(exitBox);
+  const exitLabel = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.44, 0.165),
+    new THREE.MeshBasicMaterial({ map: exitL.tex, transparent: true })
+  );
+  exitLabel.position.set(0, -0.42, 0.04);
+  billboard.add(exitLabel);
 
   // ---------- Round control ----------
   function startRound() {
@@ -445,6 +489,7 @@
     streak = 0;
     timeLeft = 60;
     lastTickSecond = 61;
+    finalFlash = 0;
     resetOrbs(true);
     placeHoop(false);
     drawPad('RESTART', 'round running');
@@ -457,12 +502,23 @@
 
   function endRound() {
     mode = 'free';
-    if (roundScore > bestRound) { bestRound = roundScore; saveBest(); }
+    lastRoundScore = roundScore;
+    const isNewBest = roundScore > bestRound && roundScore > 0;
+    if (isNewBest) { bestRound = roundScore; saveBest(); }
+    finalFlash = 4;
     drawPad('START', '60 sec round');
     drawBoard();
     ensureAudio();
-    tone(196, 0.45, 'square', 0.35);
-    tone(147, 0.65, 'square', 0.35, null, 0.06);
+    if (isNewBest) {
+      spawnPopup('NEW BEST!', board.position.clone().add(new THREE.Vector3(0, -0.6, 0.2)), '#e8c76f');
+      tone(784, 0.1, 'sine', 0.35);
+      tone(988, 0.1, 'sine', 0.35, null, 0.1);
+      tone(1175, 0.12, 'sine', 0.35, null, 0.2);
+      tone(1568, 0.28, 'sine', 0.32, null, 0.3);
+    } else {
+      tone(196, 0.45, 'square', 0.35);
+      tone(147, 0.65, 'square', 0.35, null, 0.06);
+    }
     for (const c of controllers) pulse(c, 0.7, 250);
   }
 
@@ -508,7 +564,8 @@
     tone(1320, 0.2, 'sine', 0.3, null, 0.18);
     if (pts > 1) tone(1760, 0.16, 'sine', 0.22, null, 0.27);
     for (const c of controllers) pulse(c, 0.8, 120);
-    placeHoop(Math.random() < 0.22);
+    const goldenChance = (mode === 'round' && timeLeft <= 15) ? 0.5 : 0.22;
+    placeHoop(Math.random() < goldenChance);
   }
 
   function settleOrb(g) {
@@ -523,7 +580,7 @@
     u.thrown = false;
   }
 
-  // ---------- Controllers (also drives hand rays + system pinch) ----------
+  // ---------- Controllers ----------
   const raycaster = new THREE.Raycaster();
   const tmpMatrix = new THREE.Matrix4();
   const controllers = [];
@@ -558,7 +615,7 @@
     tmpMatrix.identity().extractRotation(ctrl.matrixWorld);
     raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
     raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMatrix);
-    const hits = raycaster.intersectObjects(grabbables.concat([padBox]), false);
+    const hits = raycaster.intersectObjects(grabbables.concat([padBox, exitBox]), false);
     return hits.length ? hits[0].object : null;
   }
 
@@ -583,6 +640,7 @@
     held.userData.thrown = true;
     held.userData.scored = false;
     held.material.emissiveIntensity = held.userData.baseEmissive;
+    held.userData.trail.material.opacity = streak >= 3 ? 0.85 : 0.45;
     fillTrail(held);
     held.userData.trail.visible = true;
     ensureAudio();
@@ -598,8 +656,13 @@
       pulse(ctrl, 0.5, 80);
       return;
     }
+    if (hover === exitBox) {
+      pulse(ctrl, 0.5, 80);
+      if (xrSession) xrSession.end();
+      return;
+    }
     let target = hover;
-    if (!target || target.userData.heldBy) {
+    if (!target || !target.userData.grabbable || target.userData.heldBy) {
       const cpos = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
       let nearest = null, bestDist = 0.35;
       for (const g of grabbables) {
@@ -643,7 +706,8 @@
     ctrl.userData = {
       held: null,
       sampler: makeSampler(),
-      inputSource: null
+      inputSource: null,
+      lastHover: null
     };
     const visual = makeControllerVisual();
     visual.name = 'visual';
@@ -671,7 +735,7 @@
     controllers.push(ctrl);
   }
 
-  // ---------- Hand joint rendering + pinch-point motion ----------
+  // ---------- Hand joints ----------
   const JOINT_NAMES = [
     'wrist',
     'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
@@ -814,10 +878,10 @@
   }
 
   function doTeleport() {
-    const camPos = new THREE.Vector3();
-    camera.getWorldPosition(camPos);
-    rig.position.x += teleport.target.x - camPos.x;
-    rig.position.z += teleport.target.z - camPos.z;
+    const cp = new THREE.Vector3();
+    camera.getWorldPosition(cp);
+    rig.position.x += teleport.target.x - cp.x;
+    rig.position.z += teleport.target.z - cp.z;
     rig.updateMatrixWorld(true);
     resetAllSamplers();
     ensureAudio();
@@ -862,7 +926,7 @@
       const ax = gp.axes.length >= 4 ? gp.axes[2] : (gp.axes[0] || 0);
       const ay = gp.axes.length >= 4 ? gp.axes[3] : (gp.axes[1] || 0);
 
-      if (!passthrough) {  // teleport & snap only make sense in full VR
+      if (!passthrough) {
         if (src.handedness === 'right') {
           if (snapReady && Math.abs(ax) > 0.7) {
             snapTurn(ax > 0 ? -Math.PI / 6 : Math.PI / 6);
@@ -893,6 +957,7 @@
       if (b && b.length > 5 && b[5]) {
         if (bReady && b[5].pressed) {
           freeScore = 0; roundScore = 0; bestRound = 0; streak = 0;
+          lastRoundScore = 0; finalFlash = 0;
           saveBest();
           if (mode === 'round') { mode = 'free'; drawPad('START', '60 sec round'); }
           drawBoard();
@@ -985,25 +1050,28 @@
     const dt = Math.min(clock.getDelta(), 0.05);
     const t = clock.elapsedTime;
 
-    // Round timer
     if (mode === 'round') {
       timeLeft -= dt;
       const s = Math.ceil(timeLeft);
       if (s !== lastTickSecond) {
         lastTickSecond = s;
+        if (s === 15) { ensureAudio(); tone(740, 0.1, 'square', 0.3); tone(740, 0.1, 'square', 0.3, null, 0.15); }
         if (s >= 1 && s <= 5) { ensureAudio(); tone(950, 0.06, 'square', 0.25); }
         drawBoard();
       }
       if (timeLeft <= 0) endRound();
     }
 
-    // Golden hoop expiry
+    if (finalFlash > 0) {
+      finalFlash -= dt;
+      if (finalFlash <= 0) { finalFlash = 0; drawBoard(); }
+    }
+
     if (hoopGolden) {
       goldenTimer -= dt;
       if (goldenTimer <= 0) placeHoop(false);
     }
 
-    // Hoop movement: anchored bob + lateral drift that ramps with round score
     const driftAmp = (mode === 'round' && roundScore >= 6)
       ? Math.min(0.7, 0.25 + roundScore * 0.03) : 0;
     const driftSpeed = 1.2 + roundScore * 0.05;
@@ -1013,22 +1081,23 @@
     hoop.updateMatrixWorld(true);
     hoop.material.emissiveIntensity = 0.5 + Math.sin(t * (hoopGolden ? 5 : 2.5)) * 0.2;
 
-    // Billboard the start kiosk toward the player
     camera.getWorldPosition(camPos);
-    billboard.rotation.y = Math.atan2(camPos.x - PAD_POS.x, camPos.z - PAD_POS.z);
+    billboard.rotation.y = Math.atan2(camPos.x - PAD_POS.x, camPos.z - PAD_POS.z) - kiosk.rotation.y;
     beacon.material.opacity = 0.1 + Math.sin(t * 2.2) * 0.06;
 
-    // Hands first (fills pinch samplers)
     if (frame) updateHands(frame, t);
 
-    // Controllers: sampler + hover + carry
-    let padHovered = false;
+    let padHovered = false, exitHovered = false;
     for (const ctrl of controllers) {
       ctrl.getWorldPosition(wp);
       ctrl.userData.sampler.push(wp, t);
 
       const hover = ctrl.userData.held ? null : findHover(ctrl);
       if (hover === padBox) padHovered = true;
+      if (hover === exitBox) exitHovered = true;
+      if (hover && hover !== ctrl.userData.lastHover) pulse(ctrl, 0.15, 12);
+      ctrl.userData.lastHover = hover;
+
       const visual = ctrl.getObjectByName('visual');
       const rayLine = visual ? visual.getObjectByName('ray') : null;
       if (rayLine) rayLine.material.opacity = hover ? 1.0 : 0.5;
@@ -1059,10 +1128,10 @@
       }
     }
     padBox.material.emissiveIntensity = padHovered ? 0.9 : (0.3 + Math.sin(t * 2) * 0.1);
+    exitBox.material.emissiveIntensity = exitHovered ? 0.8 : 0.25;
 
     if (renderer.xr.isPresenting) handleLocomotion();
 
-    // Object motion + hoop scoring + pad collision
     for (const g of grabbables) {
       const u = g.userData;
       if (u.heldBy) continue;
@@ -1111,7 +1180,6 @@
       }
     }
 
-    // Score popups
     for (const p of popups) {
       if (p.life > 0) {
         p.life -= dt;
@@ -1120,7 +1188,6 @@
       }
     }
 
-    // Particle burst
     if (burstLife > 0) {
       burstLife -= dt;
       for (let i = 0; i < PCOUNT; i++) {
