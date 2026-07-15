@@ -15,41 +15,49 @@
   }
   #hud h1 { font-size: 20px; font-weight: 600; letter-spacing: 0.12em;
     text-transform: uppercase; margin: 0; color: #7fd4e0; }
-  #hud p { margin: 0; font-size: 12.5px; opacity: 0.75; max-width: 540px; line-height: 1.55; }
-  #enterVR {
-    pointer-events: auto; cursor: pointer; border: 1px solid #2ea3b5;
+  #hud p { margin: 0; font-size: 12.5px; opacity: 0.75; max-width: 560px; line-height: 1.55; }
+  #btnRow { display: flex; gap: 12px; pointer-events: auto; }
+  .xrbtn {
+    cursor: pointer; border: 1px solid #2ea3b5;
     background: rgba(10, 30, 45, 0.85); color: #9fe8f2; font-size: 15px;
-    letter-spacing: 0.08em; padding: 14px 34px; border-radius: 999px;
+    letter-spacing: 0.08em; padding: 14px 30px; border-radius: 999px;
     transition: background 0.2s, transform 0.2s;
   }
-  #enterVR:hover { background: rgba(20, 60, 80, 0.95); transform: translateY(-2px); }
-  #enterVR:disabled { opacity: 0.4; cursor: default; transform: none; }
+  .xrbtn:hover { background: rgba(20, 60, 80, 0.95); transform: translateY(-2px); }
+  .xrbtn:disabled { opacity: 0.4; cursor: default; transform: none; }
+  #enterAR { border-color: #7fe0b0; color: #aef0d0; display: none; }
 </style>
 </head>
 <body>
 <div id="hud">
   <h1>Technology Hub &middot; Orb Toss</h1>
-  <p id="hint">Point at an orb (controller ray, or bare-hand ray) and squeeze trigger/grip or pinch — even from a distance,
-     it flies to your hand. Release mid-swing to throw it through the ring. Streaks multiply points.
-     Hit the START pad for a 60-second round. Left stick: teleport &middot; Right stick: snap turn &middot;
-     A: reset orbs &middot; B: reset scores. Desktop preview: drag to look.</p>
-  <button id="enterVR" disabled>Checking VR&hellip;</button>
+  <p id="hint">Point at an orb (controller or bare-hand ray), pinch or squeeze to pull it to you, throw it through the ring.
+     Streaks multiply points; gold rings score double. Find the glowing pillar and hit START for a 60-second round —
+     the ring starts moving as your score climbs. Mixed Reality mode plays in your real room.
+     Left stick: teleport &middot; Right stick: snap turn &middot; A: reset orbs &middot; B: reset scores.</p>
+  <div id="btnRow">
+    <button id="enterVR" class="xrbtn" disabled>Checking VR&hellip;</button>
+    <button id="enterAR" class="xrbtn">Enter Mixed Reality</button>
+  </div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 (function () {
   // ---------- Renderer, scene, camera ----------
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x000000, 0);
   renderer.outputEncoding = THREE.sRGBEncoding;
   renderer.xr.enabled = true;
   document.body.appendChild(renderer.domElement);
 
+  const BG_COLOR = new THREE.Color(0x060b18);
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x060b18);
-  scene.fog = new THREE.Fog(0x060b18, 8, 30);
+  scene.background = BG_COLOR;
+  const FOG = new THREE.Fog(0x060b18, 8, 30);
+  scene.fog = FOG;
 
   const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 100);
   camera.position.set(0, 1.6, 3);
@@ -57,6 +65,8 @@
   const rig = new THREE.Group();
   rig.add(camera);
   scene.add(rig);
+
+  let passthrough = false;   // true while in Mixed Reality (immersive-ar)
 
   // ---------- Audio (synthesised, no assets) ----------
   let audioCtx = null, masterGain = null;
@@ -109,7 +119,7 @@
     };
   }
   const CTRL_THROW_MULT = 1.25;
-  const HAND_THROW_MULT = 1.5;   // pinch release is detected slightly late; compensate
+  const HAND_THROW_MULT = 1.5;
 
   // ---------- Lighting ----------
   scene.add(new THREE.HemisphereLight(0x88bfd6, 0x0a1226, 0.55));
@@ -120,7 +130,7 @@
   warm.position.set(-4, 2, -4);
   scene.add(warm);
 
-  // ---------- Environment ----------
+  // ---------- Environment (hidden in Mixed Reality) ----------
   const floorGeo = new THREE.CircleGeometry(9, 64);
   floorGeo.rotateX(-Math.PI / 2);
   const floor = new THREE.Mesh(
@@ -153,9 +163,20 @@
   }
   const starGeo = new THREE.BufferGeometry();
   starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
-  scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({
+  const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({
     color: 0xa8d8e8, size: 0.06, sizeAttenuation: true, transparent: true, opacity: 0.85
-  })));
+  }));
+  scene.add(stars);
+
+  function setPassthrough(on) {
+    passthrough = on;
+    floor.visible = !on;
+    grid.visible = !on;
+    edgeRing.visible = !on;
+    stars.visible = !on;
+    scene.background = on ? null : BG_COLOR;
+    scene.fog = on ? null : FOG;
+  }
 
   // ---------- Grabbable orbs (with flight trails) ----------
   const grabbables = [];
@@ -227,7 +248,7 @@
     g.userData.trail.geometry.attributes.position.needsUpdate = true;
   }
 
-  // ---------- Scoring hoop ----------
+  // ---------- Scoring hoop (normal + golden, moving in rounds) ----------
   const hoop = new THREE.Mesh(
     new THREE.TorusGeometry(0.35, 0.035, 16, 48),
     new THREE.MeshStandardMaterial({
@@ -236,22 +257,45 @@
     })
   );
   scene.add(hoop);
-  let hoopBaseY = 1.6;
 
-  function placeHoop() {
+  const hoopAnchor = new THREE.Vector3();
+  const hoopTangent = new THREE.Vector3();
+  let hoopGolden = false, goldenTimer = 0;
+
+  function placeHoop(golden) {
+    hoopGolden = !!golden;
+    goldenTimer = hoopGolden ? 9 : 0;
     const a = Math.random() * Math.PI * 2;
     const r = 2.2 + Math.random() * 2.0;
-    hoopBaseY = 1.2 + Math.random() * 1.1;
-    hoop.position.set(Math.cos(a) * r, hoopBaseY, Math.sin(a) * r);
-    hoop.lookAt(0, hoopBaseY, 0);
+    const y = 1.2 + Math.random() * 1.1;
+    hoopAnchor.set(Math.cos(a) * r, y, Math.sin(a) * r);
+    hoop.position.copy(hoopAnchor);
+    hoop.lookAt(0, y, 0);
+    const dir = new THREE.Vector3(0, y, 0).sub(hoopAnchor).setY(0).normalize();
+    hoopTangent.set(dir.z, 0, -dir.x);
+    const col = hoopGolden ? 0xe8c76f : 0x7fe0b0;
+    hoop.material.color.set(col);
+    hoop.material.emissive.set(col);
+    hoop.scale.setScalar(hoopGolden ? 0.8 : 1);
     hoop.updateMatrixWorld(true);
     for (const g of grabbables) g.userData.prevHoopZ = null;
+    if (hoopGolden) {
+      ensureAudio();
+      tone(1568, 0.1, 'sine', 0.25);
+      tone(1975, 0.14, 'sine', 0.22, null, 0.07);
+    }
   }
 
   // ---------- Game state ----------
-  let mode = 'free';          // 'free' | 'round'
-  let freeScore = 0, roundScore = 0, bestRound = 0, streak = 0;
+  let mode = 'free';
+  let freeScore = 0, roundScore = 0, streak = 0;
   let timeLeft = 0, lastTickSecond = -1;
+  let bestRound = 0;
+  try { bestRound = parseInt(localStorage.getItem('orbtoss_best') || '0', 10) || 0; } catch (e) {}
+
+  function saveBest() {
+    try { localStorage.setItem('orbtoss_best', String(bestRound)); } catch (e) {}
+  }
 
   // ---------- Scoreboard ----------
   const boardCanvas = document.createElement('canvas');
@@ -286,7 +330,7 @@
       bctx.fillText('TIME  ' + s + 's', 256, 194);
     } else {
       bctx.fillStyle = '#9fb8c8';
-      bctx.fillText('FREE PLAY  \u00B7  PAD = 60s ROUND', 256, 194);
+      bctx.fillText('FREE PLAY  \u00B7  START PAD = 60s ROUND', 256, 194);
     }
     bctx.fillStyle = '#9fb8c8';
     bctx.font = '500 24px "Segoe UI", sans-serif';
@@ -296,7 +340,39 @@
     boardTex.needsUpdate = true;
   }
 
-  // ---------- Start pad ----------
+  // ---------- Score popups ----------
+  const popups = [];
+  for (let i = 0; i < 4; i++) {
+    const c = document.createElement('canvas');
+    c.width = 128; c.height = 64;
+    const tex = new THREE.CanvasTexture(c);
+    const spr = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: tex, transparent: true, opacity: 0, depthWrite: false
+    }));
+    spr.scale.set(0.5, 0.25, 1);
+    scene.add(spr);
+    popups.push({ spr, ctx: c.getContext('2d'), tex, life: 0 });
+  }
+  let popupIdx = 0;
+
+  function spawnPopup(text, pos, color) {
+    const p = popups[popupIdx];
+    popupIdx = (popupIdx + 1) % popups.length;
+    p.ctx.clearRect(0, 0, 128, 64);
+    p.ctx.textAlign = 'center';
+    p.ctx.fillStyle = color;
+    p.ctx.font = '700 44px "Segoe UI", sans-serif';
+    p.ctx.fillText(text, 64, 46);
+    p.tex.needsUpdate = true;
+    p.spr.position.copy(pos);
+    p.spr.position.y += 0.3;
+    p.life = 1;
+    p.spr.material.opacity = 1;
+  }
+
+  // ---------- Start kiosk: pillar + beacon + billboard panel ----------
+  const PAD_POS = new THREE.Vector3(1.4, 1.15, -1.0);
+
   const padCanvas = document.createElement('canvas');
   padCanvas.width = 256; padCanvas.height = 128;
   const pctx = padCanvas.getContext('2d');
@@ -319,24 +395,48 @@
     padTex.needsUpdate = true;
   }
 
-  const startPad = new THREE.Group();
+  const kiosk = new THREE.Group();
+  kiosk.position.set(PAD_POS.x, 0, PAD_POS.z);
+  scene.add(kiosk);
+
+  const pillar = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.05, 0.07, 1.0, 12),
+    new THREE.MeshStandardMaterial({
+      color: 0x123047, emissive: 0x2ea3b5, emissiveIntensity: 0.3,
+      roughness: 0.5, metalness: 0.4
+    })
+  );
+  pillar.position.y = 0.5;
+  kiosk.add(pillar);
+
+  const beacon = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.045, 0.045, 3.2, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0x7fe0b0, transparent: true, opacity: 0.16,
+      side: THREE.DoubleSide, depthWrite: false
+    })
+  );
+  beacon.position.y = 1.6;
+  kiosk.add(beacon);
+
+  const billboard = new THREE.Group();
+  billboard.position.y = PAD_POS.y;
+  kiosk.add(billboard);
+
   const padBox = new THREE.Mesh(
-    new THREE.BoxGeometry(0.42, 0.24, 0.07),
+    new THREE.BoxGeometry(0.62, 0.36, 0.08),
     new THREE.MeshStandardMaterial({
       color: 0x0d2438, emissive: 0x2ea3b5, emissiveIntensity: 0.35,
       roughness: 0.4, metalness: 0.3
     })
   );
-  startPad.add(padBox);
+  billboard.add(padBox);
   const padLabel = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.4, 0.22),
+    new THREE.PlaneGeometry(0.6, 0.3),
     new THREE.MeshBasicMaterial({ map: padTex, transparent: true })
   );
-  padLabel.position.z = 0.038;
-  startPad.add(padLabel);
-  startPad.position.set(0.8, 1.2, -1.4);
-  startPad.lookAt(0, 1.3, 1.2);
-  scene.add(startPad);
+  padLabel.position.z = 0.045;
+  billboard.add(padLabel);
 
   // ---------- Round control ----------
   function startRound() {
@@ -346,7 +446,7 @@
     timeLeft = 60;
     lastTickSecond = 61;
     resetOrbs(true);
-    placeHoop();
+    placeHoop(false);
     drawPad('RESTART', 'round running');
     drawBoard();
     ensureAudio();
@@ -357,7 +457,7 @@
 
   function endRound() {
     mode = 'free';
-    if (roundScore > bestRound) bestRound = roundScore;
+    if (roundScore > bestRound) { bestRound = roundScore; saveBest(); }
     drawPad('START', '60 sec round');
     drawBoard();
     ensureAudio();
@@ -396,17 +496,19 @@
   function onScore(g) {
     g.userData.scored = true;
     streak++;
-    const pts = Math.min(streak, 3);
+    const pts = Math.min(streak, 3) * (hoopGolden ? 2 : 1);
     if (mode === 'round') roundScore += pts; else freeScore += pts;
+    const wasGolden = hoopGolden;
+    spawnPopup('+' + pts, hoop.position.clone(), wasGolden ? '#e8c76f' : '#7fe0b0');
+    spawnBurst(hoop.position.clone(), wasGolden ? 0xe8c76f : g.material.color.getHex());
     drawBoard();
-    spawnBurst(hoop.position.clone(), g.material.color.getHex());
     ensureAudio();
     tone(660, 0.12, 'sine', 0.35);
     tone(880, 0.14, 'sine', 0.35, null, 0.09);
     tone(1320, 0.2, 'sine', 0.3, null, 0.18);
     if (pts > 1) tone(1760, 0.16, 'sine', 0.22, null, 0.27);
     for (const c of controllers) pulse(c, 0.8, 120);
-    placeHoop();
+    placeHoop(Math.random() < 0.22);
   }
 
   function settleOrb(g) {
@@ -491,7 +593,7 @@
     ensureAudio();
     if (ctrl.userData.held) return;
     const hover = findHover(ctrl);
-    if (hover === padBox) {          // pinch/trigger on the start pad
+    if (hover === padBox) {
       startRound();
       pulse(ctrl, 0.5, 80);
       return;
@@ -554,7 +656,7 @@
     ctrl.addEventListener('connected', (e) => {
       ctrl.userData.inputSource = e.data;
       ctrl.userData.sampler.reset();
-      visual.visible = true;   // ray shows for controllers AND hands (system pointing ray)
+      visual.visible = true;
     });
     ctrl.addEventListener('disconnected', () => {
       if (ctrl.userData.held) {
@@ -569,7 +671,7 @@
     controllers.push(ctrl);
   }
 
-  // ---------- Hand joint rendering + pinch-point motion (raw WebXR joints) ----------
+  // ---------- Hand joint rendering + pinch-point motion ----------
   const JOINT_NAMES = [
     'wrist',
     'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
@@ -654,7 +756,7 @@
     }
   }
 
-  // ---------- Locomotion: teleport (left stick) + snap turn (right stick) ----------
+  // ---------- Locomotion ----------
   const ARC_POINTS = 40;
   const arcGeo = new THREE.BufferGeometry();
   const arcPos = new Float32Array(ARC_POINTS * 3);
@@ -760,25 +862,26 @@
       const ax = gp.axes.length >= 4 ? gp.axes[2] : (gp.axes[0] || 0);
       const ay = gp.axes.length >= 4 ? gp.axes[3] : (gp.axes[1] || 0);
 
-      if (src.handedness === 'right') {
-        if (snapReady && Math.abs(ax) > 0.7) {
-          snapTurn(ax > 0 ? -Math.PI / 6 : Math.PI / 6);
-          snapReady = false;
-        } else if (Math.abs(ax) < 0.3) {
-          snapReady = true;
+      if (!passthrough) {  // teleport & snap only make sense in full VR
+        if (src.handedness === 'right') {
+          if (snapReady && Math.abs(ax) > 0.7) {
+            snapTurn(ax > 0 ? -Math.PI / 6 : Math.PI / 6);
+            snapReady = false;
+          } else if (Math.abs(ax) < 0.3) {
+            snapReady = true;
+          }
         }
-      }
-
-      if (src.handedness === 'left') {
-        leftSeen = true;
-        if (ay < -0.6) {
-          teleport.aiming = true;
-          updateArc(ctrl);
-        } else if (teleport.aiming) {
-          teleport.aiming = false;
-          if (teleport.valid) doTeleport();
-          arcLine.visible = false;
-          marker.visible = false;
+        if (src.handedness === 'left') {
+          leftSeen = true;
+          if (ay < -0.6) {
+            teleport.aiming = true;
+            updateArc(ctrl);
+          } else if (teleport.aiming) {
+            teleport.aiming = false;
+            if (teleport.valid) doTeleport();
+            arcLine.visible = false;
+            marker.visible = false;
+          }
         }
       }
 
@@ -790,6 +893,7 @@
       if (b && b.length > 5 && b[5]) {
         if (bReady && b[5].pressed) {
           freeScore = 0; roundScore = 0; bestRound = 0; streak = 0;
+          saveBest();
           if (mode === 'round') { mode = 'free'; drawPad('START', '60 sec round'); }
           drawBoard();
           bReady = false;
@@ -803,7 +907,7 @@
     }
   }
 
-  // ---------- Desktop fallback: drag to look ----------
+  // ---------- Desktop fallback ----------
   let dragging = false, yaw = 0, pitch = 0, px = 0, py = 0;
   renderer.domElement.addEventListener('pointerdown', (e) => { dragging = true; px = e.clientX; py = e.clientY; });
   window.addEventListener('pointerup', () => { dragging = false; });
@@ -816,47 +920,64 @@
     camera.rotation.set(pitch, yaw, 0, 'YXZ');
   });
 
-  // ---------- Enter VR button ----------
-  const btn = document.getElementById('enterVR');
+  // ---------- Enter VR / Mixed Reality ----------
+  const btnVR = document.getElementById('enterVR');
+  const btnAR = document.getElementById('enterAR');
   const hint = document.getElementById('hint');
   let xrSession = null;
 
   if (navigator.xr) {
     navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
       if (ok) {
-        btn.disabled = false;
-        btn.textContent = 'Enter VR';
+        btnVR.disabled = false;
+        btnVR.textContent = 'Enter VR';
       } else {
-        btn.textContent = 'VR not available';
+        btnVR.textContent = 'VR not available';
         hint.textContent = 'Open this page in the Meta Quest Browser (over HTTPS) to enter VR. Desktop preview: drag to look around.';
       }
     });
+    navigator.xr.isSessionSupported('immersive-ar').then((ok) => {
+      if (ok) btnAR.style.display = 'inline-block';
+    });
   } else {
-    btn.textContent = 'WebXR not supported';
+    btnVR.textContent = 'WebXR not supported';
     hint.textContent = 'Open this page in the Meta Quest Browser (over HTTPS) to enter VR. Desktop preview: drag to look around.';
   }
 
-  btn.addEventListener('click', () => {
+  function startSession(arMode) {
     ensureAudio();
     if (xrSession) { xrSession.end(); return; }
-    navigator.xr.requestSession('immersive-vr', {
+    const sessionType = arMode ? 'immersive-ar' : 'immersive-vr';
+    navigator.xr.requestSession(sessionType, {
       optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
     }).then((session) => {
       xrSession = session;
-      btn.textContent = 'Exit VR';
-      session.addEventListener('end', () => { xrSession = null; btn.textContent = 'Enter VR'; });
+      setPassthrough(arMode);
+      rig.position.set(0, 0, 0);
+      rig.rotation.set(0, 0, 0);
+      btnVR.textContent = 'Exit';
+      btnAR.textContent = 'Exit';
+      session.addEventListener('end', () => {
+        xrSession = null;
+        setPassthrough(false);
+        btnVR.textContent = 'Enter VR';
+        btnAR.textContent = 'Enter Mixed Reality';
+      });
       renderer.xr.setSession(session);
     });
-  });
+  }
+  btnVR.addEventListener('click', () => startSession(false));
+  btnAR.addEventListener('click', () => startSession(true));
 
   // ---------- Animation loop ----------
   const clock = new THREE.Clock();
   const GRAVITY = -3.2;
   const wp = new THREE.Vector3();
+  const camPos = new THREE.Vector3();
   const localP = new THREE.Vector3();
   const holdTarget = new THREE.Vector3();
 
-  placeHoop();
+  placeHoop(false);
   drawBoard();
   drawPad('START', '60 sec round');
 
@@ -876,10 +997,31 @@
       if (timeLeft <= 0) endRound();
     }
 
-    // Hands first (fills pinch samplers for throws)
+    // Golden hoop expiry
+    if (hoopGolden) {
+      goldenTimer -= dt;
+      if (goldenTimer <= 0) placeHoop(false);
+    }
+
+    // Hoop movement: anchored bob + lateral drift that ramps with round score
+    const driftAmp = (mode === 'round' && roundScore >= 6)
+      ? Math.min(0.7, 0.25 + roundScore * 0.03) : 0;
+    const driftSpeed = 1.2 + roundScore * 0.05;
+    hoop.position.copy(hoopAnchor)
+      .addScaledVector(hoopTangent, driftAmp > 0 ? Math.sin(t * driftSpeed) * driftAmp : 0);
+    hoop.position.y = hoopAnchor.y + Math.sin(t * 1.4) * 0.05;
+    hoop.updateMatrixWorld(true);
+    hoop.material.emissiveIntensity = 0.5 + Math.sin(t * (hoopGolden ? 5 : 2.5)) * 0.2;
+
+    // Billboard the start kiosk toward the player
+    camera.getWorldPosition(camPos);
+    billboard.rotation.y = Math.atan2(camPos.x - PAD_POS.x, camPos.z - PAD_POS.z);
+    beacon.material.opacity = 0.1 + Math.sin(t * 2.2) * 0.06;
+
+    // Hands first (fills pinch samplers)
     if (frame) updateHands(frame, t);
 
-    // Controllers: sampler + hover + carry (pull-to-hand)
+    // Controllers: sampler + hover + carry
     let padHovered = false;
     for (const ctrl of controllers) {
       ctrl.getWorldPosition(wp);
@@ -913,7 +1055,6 @@
           const forward = new THREE.Vector3(0, 0, (src && src.hand) ? -0.1 : -0.25).applyMatrix4(tmpMatrix);
           holdTarget.copy(wp).add(forward);
         }
-        // Smooth pull: distance grabs glide to the hand, near grabs feel instant
         ctrl.userData.held.position.lerp(holdTarget, Math.min(1, dt * 12));
       }
     }
@@ -946,13 +1087,11 @@
           g.rotation.x += u.spin.x * dt * 3;
           g.rotation.y += u.spin.y * dt * 3;
 
-          // Start pad hit
-          if (g.position.distanceTo(startPad.position) < 0.3 && u.velocity.length() > 1) {
+          if (g.position.distanceTo(PAD_POS) < 0.35 && u.velocity.length() > 1) {
             u.velocity.multiplyScalar(-0.4);
             startRound();
           }
 
-          // Hoop pass detection
           localP.copy(g.position);
           hoop.worldToLocal(localP);
           if (u.prevHoopZ !== null && u.prevHoopZ > 0 && localP.z <= 0 &&
@@ -972,6 +1111,15 @@
       }
     }
 
+    // Score popups
+    for (const p of popups) {
+      if (p.life > 0) {
+        p.life -= dt;
+        p.spr.position.y += dt * 0.5;
+        p.spr.material.opacity = Math.max(0, p.life);
+      }
+    }
+
     // Particle burst
     if (burstLife > 0) {
       burstLife -= dt;
@@ -985,10 +1133,7 @@
       burstMat.opacity = Math.max(0, burstLife / BURST_DUR);
     }
 
-    // Ambient animation
     edgeRing.material.color.setHSL(0.52, 0.7, 0.45 + Math.sin(t * 0.8) * 0.1);
-    hoop.material.emissiveIntensity = 0.5 + Math.sin(t * 2.5) * 0.2;
-    hoop.position.y = hoopBaseY + Math.sin(t * 1.4) * 0.05;
 
     renderer.render(scene, camera);
   });
