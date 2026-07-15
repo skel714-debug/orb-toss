@@ -11,11 +11,11 @@
     position: fixed; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: flex-end; pointer-events: none;
     font-family: "Segoe UI", system-ui, sans-serif; color: #cfe8ef;
-    padding-bottom: 42px; gap: 12px; text-align: center;
+    padding-bottom: 40px; gap: 12px; text-align: center;
   }
   #hud h1 { font-size: 20px; font-weight: 600; letter-spacing: 0.12em;
     text-transform: uppercase; margin: 0; color: #7fd4e0; }
-  #hud p { margin: 0; font-size: 12.5px; opacity: 0.75; max-width: 520px; line-height: 1.55; }
+  #hud p { margin: 0; font-size: 12.5px; opacity: 0.75; max-width: 540px; line-height: 1.55; }
   #enterVR {
     pointer-events: auto; cursor: pointer; border: 1px solid #2ea3b5;
     background: rgba(10, 30, 45, 0.85); color: #9fe8f2; font-size: 15px;
@@ -29,9 +29,10 @@
 <body>
 <div id="hud">
   <h1>Technology Hub &middot; Orb Toss</h1>
-  <p id="hint">Grab orbs (trigger/grip, or pinch with bare hands) and throw them through the glowing ring to score.
-     Left stick: aim + release to teleport &middot; Right stick: snap turn &middot; A: reset orbs &middot; B: reset score.
-     Desktop preview: drag to look around.</p>
+  <p id="hint">Point at an orb (controller ray, or bare-hand ray) and squeeze trigger/grip or pinch — even from a distance,
+     it flies to your hand. Release mid-swing to throw it through the ring. Streaks multiply points.
+     Hit the START pad for a 60-second round. Left stick: teleport &middot; Right stick: snap turn &middot;
+     A: reset orbs &middot; B: reset scores. Desktop preview: drag to look.</p>
   <button id="enterVR" disabled>Checking VR&hellip;</button>
 </div>
 
@@ -82,7 +83,33 @@
     o.connect(gn); gn.connect(masterGain);
     o.start(t0); o.stop(t0 + dur + 0.02);
   }
-  window.addEventListener('pointerdown', ensureAudio, { once: false });
+  window.addEventListener('pointerdown', ensureAudio);
+
+  // ---------- Motion sampler (windowed velocity for natural throws) ----------
+  function makeSampler() {
+    return {
+      buf: [],
+      push(p, t) {
+        this.buf.push({ x: p.x, y: p.y, z: p.z, t });
+        while (this.buf.length > 12) this.buf.shift();
+      },
+      vel(win) {
+        const b = this.buf;
+        const out = new THREE.Vector3();
+        if (b.length < 2) return out;
+        const newest = b[b.length - 1];
+        let i = b.length - 2;
+        while (i > 0 && (newest.t - b[i].t) < win) i--;
+        const old = b[i];
+        const dt = newest.t - old.t;
+        if (dt <= 0) return out;
+        return out.set((newest.x - old.x) / dt, (newest.y - old.y) / dt, (newest.z - old.z) / dt);
+      },
+      reset() { this.buf.length = 0; }
+    };
+  }
+  const CTRL_THROW_MULT = 1.25;
+  const HAND_THROW_MULT = 1.5;   // pinch release is detected slightly late; compensate
 
   // ---------- Lighting ----------
   scene.add(new THREE.HemisphereLight(0x88bfd6, 0x0a1226, 0.55));
@@ -93,7 +120,7 @@
   warm.position.set(-4, 2, -4);
   scene.add(warm);
 
-  // ---------- Environment: grid platform + stars ----------
+  // ---------- Environment ----------
   const floorGeo = new THREE.CircleGeometry(9, 64);
   floorGeo.rotateX(-Math.PI / 2);
   const floor = new THREE.Mesh(
@@ -108,9 +135,9 @@
   grid.material.opacity = 0.55;
   scene.add(grid);
 
-  const ringGeo = new THREE.RingGeometry(8.85, 9, 96);
-  ringGeo.rotateX(-Math.PI / 2);
-  const edgeRing = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0x4fd6e8 }));
+  const edgeGeo = new THREE.RingGeometry(8.85, 9, 96);
+  edgeGeo.rotateX(-Math.PI / 2);
+  const edgeRing = new THREE.Mesh(edgeGeo, new THREE.MeshBasicMaterial({ color: 0x4fd6e8 }));
   edgeRing.position.y = 0.004;
   scene.add(edgeRing);
 
@@ -130,8 +157,9 @@
     color: 0xa8d8e8, size: 0.06, sizeAttenuation: true, transparent: true, opacity: 0.85
   })));
 
-  // ---------- Grabbable objects ----------
+  // ---------- Grabbable orbs (with flight trails) ----------
   const grabbables = [];
+  const TRAIL_LEN = 14;
   const palette = [0x4fd6e8, 0x7fe0b0, 0x6f8ff0, 0xe8c76f, 0xe07fb0, 0x9f7fe0];
   const shapes = [
     () => new THREE.IcosahedronGeometry(0.14, 0),
@@ -154,6 +182,17 @@
     const angle = (i / 10) * Math.PI * 2;
     const radius = 1.0 + (i % 3) * 0.45;
     mesh.position.set(Math.cos(angle) * radius, 1.1 + (i % 4) * 0.28, Math.sin(angle) * radius - 0.5);
+
+    const trailArr = new Float32Array(TRAIL_LEN * 3);
+    const trailGeo = new THREE.BufferGeometry();
+    trailGeo.setAttribute('position', new THREE.BufferAttribute(trailArr, 3));
+    const trail = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({
+      color, transparent: true, opacity: 0.45, depthWrite: false
+    }));
+    trail.visible = false;
+    trail.frustumCulled = false;
+    scene.add(trail);
+
     mesh.userData = {
       grabbable: true,
       home: mesh.position.clone(),
@@ -161,12 +200,31 @@
       free: false,
       heldBy: null,
       prevHoopZ: null,
+      thrown: false,
+      scored: false,
+      trail, trailArr,
       bobPhase: Math.random() * Math.PI * 2,
       spin: new THREE.Vector3((Math.random() - 0.5), (Math.random() - 0.5), (Math.random() - 0.5)).multiplyScalar(0.8),
       baseEmissive: 0.28
     };
     scene.add(mesh);
     grabbables.push(mesh);
+  }
+
+  function fillTrail(g) {
+    const a = g.userData.trailArr;
+    for (let i = 0; i < TRAIL_LEN; i++) {
+      a[i * 3] = g.position.x; a[i * 3 + 1] = g.position.y; a[i * 3 + 2] = g.position.z;
+    }
+    g.userData.trail.geometry.attributes.position.needsUpdate = true;
+  }
+  function pushTrail(g) {
+    const a = g.userData.trailArr;
+    a.copyWithin(0, 3);
+    a[(TRAIL_LEN - 1) * 3] = g.position.x;
+    a[(TRAIL_LEN - 1) * 3 + 1] = g.position.y;
+    a[(TRAIL_LEN - 1) * 3 + 2] = g.position.z;
+    g.userData.trail.geometry.attributes.position.needsUpdate = true;
   }
 
   // ---------- Scoring hoop ----------
@@ -190,14 +248,18 @@
     for (const g of grabbables) g.userData.prevHoopZ = null;
   }
 
-  // ---------- Scoreboard (canvas texture) ----------
-  let score = 0, best = 0;
+  // ---------- Game state ----------
+  let mode = 'free';          // 'free' | 'round'
+  let freeScore = 0, roundScore = 0, bestRound = 0, streak = 0;
+  let timeLeft = 0, lastTickSecond = -1;
+
+  // ---------- Scoreboard ----------
   const boardCanvas = document.createElement('canvas');
   boardCanvas.width = 512; boardCanvas.height = 256;
   const bctx = boardCanvas.getContext('2d');
   const boardTex = new THREE.CanvasTexture(boardCanvas);
   const board = new THREE.Mesh(
-    new THREE.PlaneGeometry(1.5, 0.75),
+    new THREE.PlaneGeometry(1.6, 0.8),
     new THREE.MeshBasicMaterial({ map: boardTex, transparent: true, side: THREE.DoubleSide })
   );
   board.position.set(0, 2.5, -4.2);
@@ -207,23 +269,104 @@
     bctx.clearRect(0, 0, 512, 256);
     bctx.fillStyle = 'rgba(8, 20, 38, 0.88)';
     bctx.fillRect(0, 0, 512, 256);
-    bctx.strokeStyle = '#2ea3b5';
+    bctx.strokeStyle = mode === 'round' ? '#7fe0b0' : '#2ea3b5';
     bctx.lineWidth = 6;
     bctx.strokeRect(3, 3, 506, 250);
     bctx.textAlign = 'center';
     bctx.fillStyle = '#7fd4e0';
-    bctx.font = '600 30px "Segoe UI", sans-serif';
-    bctx.fillText('O R B   T O S S', 256, 52);
+    bctx.font = '600 28px "Segoe UI", sans-serif';
+    bctx.fillText('O R B   T O S S', 256, 44);
     bctx.fillStyle = '#e8f8fb';
-    bctx.font = '700 110px "Segoe UI", sans-serif';
-    bctx.fillText(String(score), 256, 168);
+    bctx.font = '700 100px "Segoe UI", sans-serif';
+    bctx.fillText(String(mode === 'round' ? roundScore : freeScore), 256, 150);
+    bctx.font = '600 27px "Segoe UI", sans-serif';
+    if (mode === 'round') {
+      const s = Math.max(0, Math.ceil(timeLeft));
+      bctx.fillStyle = s <= 5 ? '#e8c76f' : '#9fe8f2';
+      bctx.fillText('TIME  ' + s + 's', 256, 194);
+    } else {
+      bctx.fillStyle = '#9fb8c8';
+      bctx.fillText('FREE PLAY  \u00B7  PAD = 60s ROUND', 256, 194);
+    }
     bctx.fillStyle = '#9fb8c8';
-    bctx.font = '500 26px "Segoe UI", sans-serif';
-    bctx.fillText('BEST  ' + best, 256, 222);
+    bctx.font = '500 24px "Segoe UI", sans-serif';
+    let bottom = 'BEST ROUND  ' + bestRound;
+    if (streak > 1) bottom += '    \u00B7    STREAK  x' + Math.min(streak, 3);
+    bctx.fillText(bottom, 256, 232);
     boardTex.needsUpdate = true;
   }
 
-  // ---------- Score particle burst ----------
+  // ---------- Start pad ----------
+  const padCanvas = document.createElement('canvas');
+  padCanvas.width = 256; padCanvas.height = 128;
+  const pctx = padCanvas.getContext('2d');
+  const padTex = new THREE.CanvasTexture(padCanvas);
+
+  function drawPad(label1, label2) {
+    pctx.clearRect(0, 0, 256, 128);
+    pctx.fillStyle = 'rgba(9, 26, 42, 0.95)';
+    pctx.fillRect(0, 0, 256, 128);
+    pctx.strokeStyle = '#7fe0b0';
+    pctx.lineWidth = 5;
+    pctx.strokeRect(3, 3, 250, 122);
+    pctx.textAlign = 'center';
+    pctx.fillStyle = '#7fe0b0';
+    pctx.font = '700 44px "Segoe UI", sans-serif';
+    pctx.fillText(label1, 128, 58);
+    pctx.fillStyle = '#9fe8f2';
+    pctx.font = '600 24px "Segoe UI", sans-serif';
+    pctx.fillText(label2, 128, 98);
+    padTex.needsUpdate = true;
+  }
+
+  const startPad = new THREE.Group();
+  const padBox = new THREE.Mesh(
+    new THREE.BoxGeometry(0.42, 0.24, 0.07),
+    new THREE.MeshStandardMaterial({
+      color: 0x0d2438, emissive: 0x2ea3b5, emissiveIntensity: 0.35,
+      roughness: 0.4, metalness: 0.3
+    })
+  );
+  startPad.add(padBox);
+  const padLabel = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.4, 0.22),
+    new THREE.MeshBasicMaterial({ map: padTex, transparent: true })
+  );
+  padLabel.position.z = 0.038;
+  startPad.add(padLabel);
+  startPad.position.set(0.8, 1.2, -1.4);
+  startPad.lookAt(0, 1.3, 1.2);
+  scene.add(startPad);
+
+  // ---------- Round control ----------
+  function startRound() {
+    mode = 'round';
+    roundScore = 0;
+    streak = 0;
+    timeLeft = 60;
+    lastTickSecond = 61;
+    resetOrbs(true);
+    placeHoop();
+    drawPad('RESTART', 'round running');
+    drawBoard();
+    ensureAudio();
+    tone(440, 0.09, 'sine', 0.3);
+    tone(660, 0.09, 'sine', 0.3, null, 0.1);
+    tone(880, 0.14, 'sine', 0.3, null, 0.2);
+  }
+
+  function endRound() {
+    mode = 'free';
+    if (roundScore > bestRound) bestRound = roundScore;
+    drawPad('START', '60 sec round');
+    drawBoard();
+    ensureAudio();
+    tone(196, 0.45, 'square', 0.35);
+    tone(147, 0.65, 'square', 0.35, null, 0.06);
+    for (const c of controllers) pulse(c, 0.7, 250);
+  }
+
+  // ---------- Score burst particles ----------
   const PCOUNT = 80, BURST_DUR = 0.9;
   const burstGeo = new THREE.BufferGeometry();
   const burstPos = new Float32Array(PCOUNT * 3);
@@ -251,19 +394,34 @@
   }
 
   function onScore(g) {
-    score++;
-    if (score > best) best = score;
+    g.userData.scored = true;
+    streak++;
+    const pts = Math.min(streak, 3);
+    if (mode === 'round') roundScore += pts; else freeScore += pts;
     drawBoard();
     spawnBurst(hoop.position.clone(), g.material.color.getHex());
     ensureAudio();
     tone(660, 0.12, 'sine', 0.35);
     tone(880, 0.14, 'sine', 0.35, null, 0.09);
     tone(1320, 0.2, 'sine', 0.3, null, 0.18);
+    if (pts > 1) tone(1760, 0.16, 'sine', 0.22, null, 0.27);
     for (const c of controllers) pulse(c, 0.8, 120);
     placeHoop();
   }
 
-  // ---------- Controllers ----------
+  function settleOrb(g) {
+    const u = g.userData;
+    u.free = false;
+    u.velocity.set(0, 0, 0);
+    u.trail.visible = false;
+    if (u.thrown && !u.scored && streak > 0) {
+      streak = 0;
+      drawBoard();
+    }
+    u.thrown = false;
+  }
+
+  // ---------- Controllers (also drives hand rays + system pinch) ----------
   const raycaster = new THREE.Raycaster();
   const tmpMatrix = new THREE.Matrix4();
   const controllers = [];
@@ -271,7 +429,7 @@
   function makeControllerVisual() {
     const group = new THREE.Group();
     const tip = new THREE.Mesh(
-      new THREE.SphereGeometry(0.02, 16, 12),
+      new THREE.SphereGeometry(0.018, 16, 12),
       new THREE.MeshBasicMaterial({ color: 0x9fe8f2 })
     );
     group.add(tip);
@@ -298,15 +456,33 @@
     tmpMatrix.identity().extractRotation(ctrl.matrixWorld);
     raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
     raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMatrix);
-    const hits = raycaster.intersectObjects(grabbables, false);
+    const hits = raycaster.intersectObjects(grabbables.concat([padBox]), false);
     return hits.length ? hits[0].object : null;
   }
 
+  function aimAssist(vel, from) {
+    if (vel.length() < 1.2) return vel;
+    const toHoop = hoop.position.clone().sub(from);
+    if (toHoop.length() < 0.5) return vel;
+    toHoop.normalize();
+    const dir = vel.clone().normalize();
+    const angle = dir.angleTo(toHoop);
+    if (angle < THREE.MathUtils.degToRad(18)) {
+      const blended = dir.lerp(toHoop, 0.3).normalize();
+      return blended.multiplyScalar(vel.length());
+    }
+    return vel;
+  }
+
   function releaseObject(held, throwVelocity) {
-    held.userData.velocity.copy(throwVelocity);
+    held.userData.velocity.copy(aimAssist(throwVelocity, held.position));
     held.userData.free = true;
     held.userData.heldBy = null;
+    held.userData.thrown = true;
+    held.userData.scored = false;
     held.material.emissiveIntensity = held.userData.baseEmissive;
+    fillTrail(held);
+    held.userData.trail.visible = true;
     ensureAudio();
     tone(380, 0.08, 'sine', 0.2, 300);
   }
@@ -314,16 +490,22 @@
   function onGrabStart(ctrl) {
     ensureAudio();
     if (ctrl.userData.held) return;
-    let target = findHover(ctrl);
+    const hover = findHover(ctrl);
+    if (hover === padBox) {          // pinch/trigger on the start pad
+      startRound();
+      pulse(ctrl, 0.5, 80);
+      return;
+    }
+    let target = hover;
     if (!target || target.userData.heldBy) {
       const cpos = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
-      let best2 = null, bestDist = 0.35;
+      let nearest = null, bestDist = 0.35;
       for (const g of grabbables) {
         if (g.userData.heldBy) continue;
         const d = g.position.distanceTo(cpos);
-        if (d < bestDist) { best2 = g; bestDist = d; }
+        if (d < bestDist) { nearest = g; bestDist = d; }
       }
-      target = best2;
+      target = nearest;
     }
     if (!target || target.userData.heldBy) return;
     target.userData.heldBy = ctrl;
@@ -331,6 +513,7 @@
     target.userData.free = false;
     target.userData.velocity.set(0, 0, 0);
     target.userData.prevHoopZ = null;
+    target.userData.trail.visible = false;
     target.material.emissiveIntensity = 0.8;
     pulse(ctrl, 0.6, 60);
     tone(440, 0.1, 'sine', 0.3, 620);
@@ -339,7 +522,16 @@
   function onGrabEnd(ctrl) {
     const held = ctrl.userData.held;
     if (!held) return;
-    releaseObject(held, ctrl.userData.velocity.clone().multiplyScalar(1.15));
+    const src = ctrl.userData.inputSource;
+    let vel;
+    if (src && src.hand) {
+      const h = handStates[src.handedness];
+      vel = (h && h.sampler.buf.length > 1) ? h.sampler.vel(0.09) : ctrl.userData.sampler.vel(0.09);
+      vel.multiplyScalar(HAND_THROW_MULT);
+    } else {
+      vel = ctrl.userData.sampler.vel(0.09).multiplyScalar(CTRL_THROW_MULT);
+    }
+    releaseObject(held, vel);
     ctrl.userData.held = null;
     pulse(ctrl, 0.3, 40);
   }
@@ -348,12 +540,12 @@
     const ctrl = renderer.xr.getController(i);
     ctrl.userData = {
       held: null,
-      velocity: new THREE.Vector3(),
-      prevPos: new THREE.Vector3(),
+      sampler: makeSampler(),
       inputSource: null
     };
     const visual = makeControllerVisual();
     visual.name = 'visual';
+    visual.visible = false;
     ctrl.add(visual);
     ctrl.addEventListener('selectstart', () => onGrabStart(ctrl));
     ctrl.addEventListener('selectend',   () => onGrabEnd(ctrl));
@@ -361,17 +553,23 @@
     ctrl.addEventListener('squeezeend',   () => onGrabEnd(ctrl));
     ctrl.addEventListener('connected', (e) => {
       ctrl.userData.inputSource = e.data;
-      visual.visible = !(e.data && e.data.hand);
+      ctrl.userData.sampler.reset();
+      visual.visible = true;   // ray shows for controllers AND hands (system pointing ray)
     });
     ctrl.addEventListener('disconnected', () => {
+      if (ctrl.userData.held) {
+        releaseObject(ctrl.userData.held, new THREE.Vector3());
+        ctrl.userData.held = null;
+      }
       ctrl.userData.inputSource = null;
+      ctrl.userData.sampler.reset();
       visual.visible = false;
     });
     rig.add(ctrl);
     controllers.push(ctrl);
   }
 
-  // ---------- Hand tracking (raw WebXR joint API) ----------
+  // ---------- Hand joint rendering + pinch-point motion (raw WebXR joints) ----------
   const JOINT_NAMES = [
     'wrist',
     'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
@@ -380,8 +578,6 @@
     'ring-finger-metacarpal', 'ring-finger-phalanx-proximal', 'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
     'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal', 'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'
   ];
-  const PINCH_START = 0.022;
-  const PINCH_END   = 0.038;
 
   const jointMat = new THREE.MeshStandardMaterial({
     color: 0x9fe8f2, roughness: 0.4, metalness: 0.1,
@@ -401,42 +597,14 @@
     rig.add(group);
     return {
       group, jointMeshes,
-      pinching: false,
-      held: null,
-      pinchPos: new THREE.Vector3(),
-      prevPinchPos: new THREE.Vector3(),
-      velocity: new THREE.Vector3(),
-      hasPrev: false
+      pinchWorld: new THREE.Vector3(),
+      pinchValid: false,
+      sampler: makeSampler()
     };
   }
   const handStates = { left: makeHandState(), right: makeHandState() };
 
-  function handGrabStart(h) {
-    ensureAudio();
-    if (h.held) return;
-    let best2 = null, bestDist = 0.15;
-    for (const g of grabbables) {
-      if (g.userData.heldBy) continue;
-      const d = g.position.distanceTo(h.pinchPos);
-      if (d < bestDist) { best2 = g; bestDist = d; }
-    }
-    if (!best2) return;
-    best2.userData.heldBy = h;
-    best2.userData.free = false;
-    best2.userData.velocity.set(0, 0, 0);
-    best2.userData.prevHoopZ = null;
-    best2.material.emissiveIntensity = 0.8;
-    h.held = best2;
-    tone(440, 0.1, 'sine', 0.3, 620);
-  }
-
-  function handGrabEnd(h) {
-    if (!h.held) return;
-    releaseObject(h.held, h.velocity.clone().multiplyScalar(1.1));
-    h.held = null;
-  }
-
-  function updateHands(frame, dt) {
+  function updateHands(frame, t) {
     const session = renderer.xr.getSession();
     const refSpace = renderer.xr.getReferenceSpace();
     const seen = { left: false, right: false };
@@ -465,26 +633,12 @@
         const indexPose = frame.getJointPose(source.hand.get('index-finger-tip'), refSpace);
         if (thumbPose && indexPose) {
           const tp = thumbPose.transform.position, ip = indexPose.transform.position;
-          h.pinchPos.set((tp.x + ip.x) / 2, (tp.y + ip.y) / 2, (tp.z + ip.z) / 2);
-          rig.localToWorld(h.pinchPos); // joint poses are rig-local; game logic is world-space
-          const dist = Math.hypot(tp.x - ip.x, tp.y - ip.y, tp.z - ip.z);
-
-          if (h.hasPrev && dt > 0) {
-            const v = h.pinchPos.clone().sub(h.prevPinchPos).divideScalar(dt);
-            h.velocity.lerp(v, 0.5);
-          }
-          h.prevPinchPos.copy(h.pinchPos);
-          h.hasPrev = true;
-
-          if (!h.pinching && dist < PINCH_START) {
-            h.pinching = true;
-            handGrabStart(h);
-          } else if (h.pinching && dist > PINCH_END) {
-            h.pinching = false;
-            handGrabEnd(h);
-          }
-
-          if (h.held) h.held.position.copy(h.pinchPos);
+          h.pinchWorld.set((tp.x + ip.x) / 2, (tp.y + ip.y) / 2, (tp.z + ip.z) / 2);
+          rig.localToWorld(h.pinchWorld);
+          h.pinchValid = true;
+          h.sampler.push(h.pinchWorld, t);
+        } else {
+          h.pinchValid = false;
         }
       }
     }
@@ -493,8 +647,8 @@
         const h = handStates[side];
         if (h.group.visible) {
           h.group.visible = false;
-          h.hasPrev = false;
-          if (h.pinching) { h.pinching = false; handGrabEnd(h); }
+          h.pinchValid = false;
+          h.sampler.reset();
         }
       }
     }
@@ -522,6 +676,12 @@
 
   const teleport = { aiming: false, valid: false, target: new THREE.Vector3() };
   let snapReady = true, aReady = true, bReady = true;
+
+  function resetAllSamplers() {
+    for (const c of controllers) c.userData.sampler.reset();
+    handStates.left.sampler.reset();
+    handStates.right.sampler.reset();
+  }
 
   function updateArc(ctrl) {
     const origin = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
@@ -557,7 +717,7 @@
     rig.position.x += teleport.target.x - camPos.x;
     rig.position.z += teleport.target.z - camPos.z;
     rig.updateMatrixWorld(true);
-    handStates.left.hasPrev = handStates.right.hasPrev = false;
+    resetAllSamplers();
     ensureAudio();
     tone(500, 0.15, 'sine', 0.25, 220);
   }
@@ -572,21 +732,23 @@
     rig.position.add(before.sub(after));
     rig.position.y = 0;
     rig.updateMatrixWorld(true);
-    handStates.left.hasPrev = handStates.right.hasPrev = false;
+    resetAllSamplers();
     ensureAudio();
     tone(300, 0.06, 'sine', 0.15, 380);
   }
 
-  function resetOrbs() {
+  function resetOrbs(silent) {
     for (const g of grabbables) {
       if (g.userData.heldBy) continue;
       g.position.copy(g.userData.home);
       g.userData.free = false;
       g.userData.velocity.set(0, 0, 0);
       g.userData.prevHoopZ = null;
+      g.userData.thrown = false;
+      g.userData.scored = false;
+      g.userData.trail.visible = false;
     }
-    ensureAudio();
-    tone(240, 0.12, 'sine', 0.2, 180);
+    if (!silent) { ensureAudio(); tone(240, 0.12, 'sine', 0.2, 180); }
   }
 
   function handleLocomotion() {
@@ -622,12 +784,16 @@
 
       const b = gp.buttons;
       if (b && b.length > 4 && b[4]) {
-        if (aReady && b[4].pressed) { resetOrbs(); aReady = false; }
+        if (aReady && b[4].pressed) { resetOrbs(false); aReady = false; }
         else if (!b[4].pressed) aReady = true;
       }
       if (b && b.length > 5 && b[5]) {
-        if (bReady && b[5].pressed) { score = 0; drawBoard(); bReady = false; }
-        else if (!b[5].pressed) bReady = true;
+        if (bReady && b[5].pressed) {
+          freeScore = 0; roundScore = 0; bestRound = 0; streak = 0;
+          if (mode === 'round') { mode = 'free'; drawPad('START', '60 sec round'); }
+          drawBoard();
+          bReady = false;
+        } else if (!b[5].pressed) bReady = true;
       }
     }
     if (!leftSeen && teleport.aiming) {
@@ -688,26 +854,39 @@
   const GRAVITY = -3.2;
   const wp = new THREE.Vector3();
   const localP = new THREE.Vector3();
+  const holdTarget = new THREE.Vector3();
 
   placeHoop();
   drawBoard();
+  drawPad('START', '60 sec round');
 
   renderer.setAnimationLoop((time, frame) => {
     const dt = Math.min(clock.getDelta(), 0.05);
     const t = clock.elapsedTime;
 
-    // Controllers: velocity tracking + hover highlight + carry
+    // Round timer
+    if (mode === 'round') {
+      timeLeft -= dt;
+      const s = Math.ceil(timeLeft);
+      if (s !== lastTickSecond) {
+        lastTickSecond = s;
+        if (s >= 1 && s <= 5) { ensureAudio(); tone(950, 0.06, 'square', 0.25); }
+        drawBoard();
+      }
+      if (timeLeft <= 0) endRound();
+    }
+
+    // Hands first (fills pinch samplers for throws)
+    if (frame) updateHands(frame, t);
+
+    // Controllers: sampler + hover + carry (pull-to-hand)
+    let padHovered = false;
     for (const ctrl of controllers) {
       ctrl.getWorldPosition(wp);
-      if (dt > 0) {
-        ctrl.userData.velocity
-          .copy(wp).sub(ctrl.userData.prevPos).divideScalar(dt)
-          .lerp(ctrl.userData.velocity, 0.35);
-      }
-      ctrl.userData.prevPos.copy(wp);
+      ctrl.userData.sampler.push(wp, t);
 
-      const isHand = ctrl.userData.inputSource && ctrl.userData.inputSource.hand;
-      const hover = (ctrl.userData.held || isHand) ? null : findHover(ctrl);
+      const hover = ctrl.userData.held ? null : findHover(ctrl);
+      if (hover === padBox) padHovered = true;
       const visual = ctrl.getObjectByName('visual');
       const rayLine = visual ? visual.getObjectByName('ray') : null;
       if (rayLine) rayLine.material.opacity = hover ? 1.0 : 0.5;
@@ -719,18 +898,30 @@
       }
 
       if (ctrl.userData.held) {
-        ctrl.getWorldPosition(wp);
-        tmpMatrix.identity().extractRotation(ctrl.matrixWorld);
-        const forward = new THREE.Vector3(0, 0, -0.25).applyMatrix4(tmpMatrix);
-        ctrl.userData.held.position.copy(wp).add(forward);
+        const src = ctrl.userData.inputSource;
+        let usedHand = false;
+        if (src && src.hand) {
+          const h = handStates[src.handedness];
+          if (h && h.pinchValid) {
+            holdTarget.copy(h.pinchWorld);
+            usedHand = true;
+          }
+        }
+        if (!usedHand) {
+          ctrl.getWorldPosition(wp);
+          tmpMatrix.identity().extractRotation(ctrl.matrixWorld);
+          const forward = new THREE.Vector3(0, 0, (src && src.hand) ? -0.1 : -0.25).applyMatrix4(tmpMatrix);
+          holdTarget.copy(wp).add(forward);
+        }
+        // Smooth pull: distance grabs glide to the hand, near grabs feel instant
+        ctrl.userData.held.position.lerp(holdTarget, Math.min(1, dt * 12));
       }
     }
+    padBox.material.emissiveIntensity = padHovered ? 0.9 : (0.3 + Math.sin(t * 2) * 0.1);
 
-    // Hands + locomotion
-    if (frame) updateHands(frame, dt);
     if (renderer.xr.isPresenting) handleLocomotion();
 
-    // Object motion + hoop scoring
+    // Object motion + hoop scoring + pad collision
     for (const g of grabbables) {
       const u = g.userData;
       if (u.heldBy) continue;
@@ -738,6 +929,8 @@
       if (u.free) {
         u.velocity.y += GRAVITY * dt;
         g.position.addScaledVector(u.velocity, dt);
+        pushTrail(g);
+
         if (g.position.y < 0.15) {
           const impact = Math.abs(u.velocity.y);
           g.position.y = 0.15;
@@ -745,20 +938,29 @@
           u.velocity.x *= 0.8;
           u.velocity.z *= 0.8;
           if (impact > 0.6) tone(95 + Math.random() * 40, 0.12, 'triangle', Math.min(0.45, impact * 0.06));
-          if (u.velocity.length() < 0.4) { u.free = false; u.velocity.set(0, 0, 0); }
+          if (u.velocity.length() < 0.4) settleOrb(g);
         }
-        if (g.position.length() > 8.5) { u.free = false; u.velocity.set(0, 0, 0); }
-        g.rotation.x += u.spin.x * dt * 3;
-        g.rotation.y += u.spin.y * dt * 3;
+        if (u.free && g.position.length() > 8.5) settleOrb(g);
 
-        // Hoop pass detection (crossing the ring plane within its opening)
-        localP.copy(g.position);
-        hoop.worldToLocal(localP);
-        if (u.prevHoopZ !== null && u.prevHoopZ > 0 && localP.z <= 0 &&
-            Math.sqrt(localP.x * localP.x + localP.y * localP.y) < 0.30) {
-          onScore(g);
-        } else {
-          u.prevHoopZ = localP.z;
+        if (u.free) {
+          g.rotation.x += u.spin.x * dt * 3;
+          g.rotation.y += u.spin.y * dt * 3;
+
+          // Start pad hit
+          if (g.position.distanceTo(startPad.position) < 0.3 && u.velocity.length() > 1) {
+            u.velocity.multiplyScalar(-0.4);
+            startRound();
+          }
+
+          // Hoop pass detection
+          localP.copy(g.position);
+          hoop.worldToLocal(localP);
+          if (u.prevHoopZ !== null && u.prevHoopZ > 0 && localP.z <= 0 &&
+              Math.sqrt(localP.x * localP.x + localP.y * localP.y) < 0.30) {
+            onScore(g);
+          } else {
+            u.prevHoopZ = localP.z;
+          }
         }
       } else {
         u.prevHoopZ = null;
