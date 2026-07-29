@@ -26,6 +26,20 @@
   .xrbtn:hover { background: rgba(20, 60, 80, 0.95); transform: translateY(-2px); }
   .xrbtn:disabled { opacity: 0.4; cursor: default; transform: none; }
   #enterAR { border-color: #7fe0b0; color: #aef0d0; display: none; }
+  #mpRow { display: flex; gap: 10px; pointer-events: auto; align-items: center; }
+  .mpbtn { padding: 10px 20px; font-size: 13px; border-color: #e8c76f; color: #f0d9a0; }
+  #joinCode { width: 84px; text-align: center; letter-spacing: 0.25em; font-size: 15px;
+    background: rgba(10,30,45,0.85); border: 1px solid #2ea3b5; color: #9fe8f2;
+    border-radius: 10px; padding: 10px 6px; text-transform: uppercase; }
+  #mpStatus { font-size: 12px; color: #e8c76f; min-height: 16px; letter-spacing: 0.04em; }
+  #specOverlay { position: fixed; left: 0; right: 0; bottom: 28px; display: none;
+    flex-direction: column; align-items: center; gap: 4px; pointer-events: none;
+    font-family: "Segoe UI", system-ui, sans-serif; }
+  #specTitle { color: #7fd4e0; letter-spacing: 0.25em; font-size: 13px; font-weight: 600; }
+  #specScore { color: #e8c76f; font-size: 64px; font-weight: 700; line-height: 1;
+    text-shadow: 0 2px 18px rgba(0,0,0,0.6); }
+  #specLine { color: #9fe8f2; font-size: 15px; letter-spacing: 0.12em; }
+  #specHint { color: #5a7a8a; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -34,14 +48,28 @@
   <p id="hint">Point at an orb (controller or bare-hand ray), pinch or squeeze to pull it to you, throw it through the ring.
      In Mixed Reality the game maps your real room: orbs bounce off your walls and furniture, and the ring anchors to real walls
      (requires Space Setup on the headset). Streaks multiply points; gold rings double; final 15s is Frenzy.
-     Kiosk pads: START / EXIT. Left stick: teleport &middot; Right stick: snap turn &middot; A: reset orbs &middot; B: reset scores.</p>
+     Kiosk pads: START / EXIT. Left stick: teleport &middot; Right stick: snap turn &middot; A: reset orbs &middot; B: reset scores.
+     Two-player: one headset taps Host 2-Player, the other types the code and taps Join &mdash; same arena, shared score.</p>
+  <div id="mpRow">
+    <button id="hostBtn" class="xrbtn mpbtn">Host 2-Player</button>
+    <input id="joinCode" maxlength="4" placeholder="CODE" autocapitalize="characters">
+    <button id="joinBtn" class="xrbtn mpbtn">Join</button>
+  </div>
+  <div id="mpStatus"></div>
   <div id="btnRow">
     <button id="enterVR" class="xrbtn" disabled>Checking VR&hellip;</button>
     <button id="enterAR" class="xrbtn">Enter Mixed Reality</button>
   </div>
 </div>
+<div id="specOverlay">
+  <div id="specTitle">ORB TOSS &middot; TECH HUB LIVE</div>
+  <div id="specScore">0</div>
+  <div id="specLine">&#9679; LIVE</div>
+  <div id="specHint">drag: manual camera &middot; press C: cinematic</div>
+</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.2/peerjs.min.js"></script>
 <script>
 (function () {
   // ---------- Renderer, scene, camera ----------
@@ -78,6 +106,8 @@
   const holdTarget = new THREE.Vector3();
   const tmpN = new THREE.Vector3();
   const tmpV = new THREE.Vector3();
+  const tmpUp = new THREE.Vector3();
+  const tmpQ = new THREE.Quaternion();
 
   // ---------- Audio ----------
   let audioCtx = null, masterGain = null;
@@ -92,7 +122,7 @@
     }
     if (audioCtx.state === 'suspended') audioCtx.resume();
   }
-  function tone(freq, dur, type, vol, slideTo, delay) {
+  function tone(freq, dur, type, vol, slideTo, delay, pos) {
     if (!audioCtx) return;
     const t0 = audioCtx.currentTime + (delay || 0);
     const o = audioCtx.createOscillator(), gn = audioCtx.createGain();
@@ -101,10 +131,38 @@
     if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
     gn.gain.setValueAtTime(vol || 0.4, t0);
     gn.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
-    o.connect(gn); gn.connect(masterGain);
+    o.connect(gn);
+    let outNode = gn;
+    if (pos && audioCtx.createPanner) {
+      try {
+        const pan = audioCtx.createPanner();
+        pan.panningModel = 'equalpower';
+        pan.distanceModel = 'inverse';
+        pan.refDistance = 1.5;
+        if (pan.positionX) {
+          pan.positionX.value = pos.x; pan.positionY.value = pos.y; pan.positionZ.value = pos.z;
+        } else if (pan.setPosition) {
+          pan.setPosition(pos.x, pos.y, pos.z);
+        }
+        gn.connect(pan);
+        outNode = pan;
+      } catch (e) { outNode = gn; }
+    }
+    outNode.connect(masterGain);
     o.start(t0); o.stop(t0 + dur + 0.02);
   }
   window.addEventListener('pointerdown', ensureAudio);
+
+  // Voice announcer — browser speech synthesis, no assets, silently skipped if unsupported
+  function say(text) {
+    try {
+      if (!window.speechSynthesis) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.05; u.pitch = 1.0; u.volume = 0.9;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+    } catch (e) {}
+  }
 
   // ---------- Motion sampler ----------
   function makeSampler() {
@@ -126,11 +184,33 @@
         if (dt <= 0) return out;
         return out.set((newest.x - old.x) / dt, (newest.y - old.y) / dt, (newest.z - old.z) / dt);
       },
+      // Peak windowed velocity over the recent past — rescues hand throws where
+      // pinch-release is detected after the hand has already decelerated.
+      velPeak(win, sub) {
+        const b = this.buf;
+        const out = new THREE.Vector3();
+        if (b.length < 2) return out;
+        const tNew = b[b.length - 1].t;
+        let bestMag = 0;
+        for (let i = b.length - 1; i > 0; i--) {
+          if (tNew - b[i].t > win) break;
+          let j = i - 1;
+          while (j > 0 && (b[i].t - b[j].t) < sub) j--;
+          const dt = b[i].t - b[j].t;
+          if (dt <= 0) continue;
+          const vx = (b[i].x - b[j].x) / dt;
+          const vy = (b[i].y - b[j].y) / dt;
+          const vz = (b[i].z - b[j].z) / dt;
+          const mag = vx * vx + vy * vy + vz * vz;
+          if (mag > bestMag) { bestMag = mag; out.set(vx, vy, vz); }
+        }
+        return out;
+      },
       reset() { this.buf.length = 0; }
     };
   }
   const CTRL_THROW_MULT = 1.25;
-  const HAND_THROW_MULT = 1.5;
+  const HAND_THROW_MULT = 1.35;  // applied to peak velocity, which reads higher than the old average
 
   // ---------- Lighting ----------
   scene.add(new THREE.HemisphereLight(0x88bfd6, 0x0a1226, 0.55));
@@ -225,6 +305,7 @@
       prevHoopZ: null,
       thrown: false,
       scored: false,
+      charged: false,
       trail, trailArr,
       bobPhase: Math.random() * Math.PI * 2,
       spin: new THREE.Vector3((Math.random() - 0.5), (Math.random() - 0.5), (Math.random() - 0.5)).multiplyScalar(0.8),
@@ -281,6 +362,33 @@
     planeCtx.clear();
     revealTimer = 0;
     roomAnnounced = false;
+    roomBounds.valid = false;
+  }
+
+  const roomBounds = { minX: 0, maxX: 0, minZ: 0, maxZ: 0, maxY: 0, valid: false };
+  function computeRoomBounds() {
+    roomBounds.valid = false;
+    let n = 0;
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, maxY = -Infinity;
+    for (const [, c] of planeCtx) {
+      if (c.poly.length < 3) continue;
+      const corners = [[c.minX, c.minZ], [c.minX, c.maxZ], [c.maxX, c.minZ], [c.maxX, c.maxZ]];
+      for (const cr of corners) {
+        tmpV.set(cr[0], 0, cr[1]).applyMatrix4(c.matrix);
+        if (tmpV.x < minX) minX = tmpV.x;
+        if (tmpV.x > maxX) maxX = tmpV.x;
+        if (tmpV.z < minZ) minZ = tmpV.z;
+        if (tmpV.z > maxZ) maxZ = tmpV.z;
+        if (tmpV.y > maxY) maxY = tmpV.y;
+        n++;
+      }
+    }
+    if (n >= 8 && maxX - minX > 1.2 && maxZ - minZ > 1.2) {
+      roomBounds.minX = minX; roomBounds.maxX = maxX;
+      roomBounds.minZ = minZ; roomBounds.maxZ = maxZ;
+      roomBounds.maxY = Math.max(1.8, maxY);
+      roomBounds.valid = true;
+    }
   }
 
   function updatePlanes(frame, dt) {
@@ -405,7 +513,7 @@
           tmpV.copy(u.velocity).addScaledVector(tmpN, -vn2); // tangential part
           tmpV.multiplyScalar(0.85);
           u.velocity.copy(tmpV).addScaledVector(tmpN, vn2);
-          if (impact > 0.6) tone(95 + Math.random() * 40, 0.12, 'triangle', Math.min(0.45, impact * 0.06));
+          if (impact > 0.6) tone(95 + Math.random() * 40, 0.12, 'triangle', Math.min(0.45, impact * 0.06), null, 0, g.position);
           c.flash = 1;
           if (u.velocity.length() < 0.4) settleOrb(g);
         }
@@ -457,11 +565,48 @@
     return false;
   }
 
+  // Free-space placement clamped inside the scanned room (fallback when no wall fits)
+  function placeHoopInRoom() {
+    const m = 0.6;
+    if (roomBounds.maxX - roomBounds.minX < m * 2 + 0.4 ||
+        roomBounds.maxZ - roomBounds.minZ < m * 2 + 0.4) return false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const x = roomBounds.minX + m + Math.random() * (roomBounds.maxX - roomBounds.minX - m * 2);
+      const z = roomBounds.minZ + m + Math.random() * (roomBounds.maxZ - roomBounds.minZ - m * 2);
+      const y = 1.1 + Math.random() * Math.max(0.3, Math.min(1.0, roomBounds.maxY - 1.5));
+      const dx = x - camPos.x, dz = z - camPos.z;
+      const d = Math.hypot(dx, dz);
+      if (d < 1.2) continue;
+      hoopAnchor.set(x, y, z);
+      hoop.position.copy(hoopAnchor);
+      hoop.lookAt(camPos.x, y, camPos.z);
+      hoopTangent.set(dz / d, 0, -dx / d);
+      return true;
+    }
+    return false;
+  }
+
   function placeHoop(golden) {
     hoopGolden = !!golden;
     goldenTimer = hoopGolden ? 9 : 0;
     let placed = false;
-    if (passthrough && planeCtx.size > 0) placed = placeHoopOnWall();
+    if (passthrough && planeCtx.size > 0) {
+      computeRoomBounds();
+      placed = placeHoopOnWall();
+      if (!placed && roomBounds.valid) placed = placeHoopInRoom();
+      if (!placed) {
+        // Last resort: 1.6 m in front of the player, facing them
+        camera.getWorldDirection(camFwd);
+        camFwd.y = 0;
+        if (camFwd.lengthSq() < 0.01) camFwd.set(0, 0, -1); else camFwd.normalize();
+        hoopAnchor.copy(camPos).addScaledVector(camFwd, 1.6);
+        hoopAnchor.y = 1.5;
+        hoop.position.copy(hoopAnchor);
+        hoop.lookAt(camPos.x, 1.5, camPos.z);
+        hoopTangent.set(camFwd.z, 0, -camFwd.x);
+        placed = true;
+      }
+    }
     if (!placed) {
       const a = Math.random() * Math.PI * 2;
       const r = 2.2 + Math.random() * 2.0;
@@ -475,14 +620,64 @@
     const col = hoopGolden ? 0xe8c76f : 0x7fe0b0;
     hoop.material.color.set(col);
     hoop.material.emissive.set(col);
-    hoop.scale.setScalar(hoopGolden ? 0.8 : 1);
+    updateHoopScale();
     hoop.updateMatrixWorld(true);
     for (const g of grabbables) g.userData.prevHoopZ = null;
     if (hoopGolden) {
       ensureAudio();
-      tone(1568, 0.1, 'sine', 0.25);
-      tone(1975, 0.14, 'sine', 0.22, null, 0.07);
+      tone(1568, 0.1, 'sine', 0.25, null, 0, hoop.position);
+      tone(1975, 0.14, 'sine', 0.22, null, 0.07, hoop.position);
+      say('Gold ring!');
     }
+  }
+
+  // ---------- Power-up orbs ----------
+  const power = { kind: '', timer: 0, chargeIdx: -1, chargeTimer: 9 };
+  const POWER_INFO = {
+    slow:   { label: 'SLOW-MO',    dur: 4,  color: '#e07fb0', voice: 'Slow motion!' },
+    double: { label: 'DOUBLE PTS', dur: 10, color: '#e8c76f', voice: 'Double points!' },
+    big:    { label: 'BIG RING',   dur: 10, color: '#7fe0b0', voice: 'Big ring!' }
+  };
+  function updateHoopScale() {
+    hoop.scale.setScalar((hoopGolden ? 0.8 : 1) * (power.kind === 'big' ? 1.4 : 1));
+  }
+  function clearCharge() {
+    if (power.chargeIdx >= 0 && grabbables[power.chargeIdx]) {
+      grabbables[power.chargeIdx].userData.charged = false;
+    }
+    power.chargeIdx = -1;
+  }
+  function chargeRandomOrb() {
+    const idle = [];
+    for (let i = 0; i < grabbables.length; i++) {
+      const u = grabbables[i].userData;
+      if (!u.heldBy && !u.free && !u.charged) idle.push(i);
+    }
+    if (!idle.length) return;
+    const i = idle[Math.floor(Math.random() * idle.length)];
+    power.chargeIdx = i;
+    grabbables[i].userData.charged = true;
+    ensureAudio();
+    tone(1046, 0.12, 'sine', 0.22, 1568, 0, grabbables[i].position);
+  }
+  function activatePower(atPos) {
+    const kinds = Object.keys(POWER_INFO);
+    power.kind = kinds[Math.floor(Math.random() * kinds.length)];
+    const info = POWER_INFO[power.kind];
+    power.timer = info.dur;
+    updateHoopScale();
+    spawnPopup(info.label + '!', atPos.clone(), info.color);
+    say(info.voice);
+    ensureAudio();
+    tone(523, 0.1, 'sine', 0.3);
+    tone(784, 0.12, 'sine', 0.3, null, 0.08);
+    drawBoard();
+  }
+  function expirePower() {
+    power.kind = '';
+    power.timer = 0;
+    updateHoopScale();
+    drawBoard();
   }
 
   // ---------- Game state ----------
@@ -552,6 +747,7 @@
     bctx.font = '500 24px "Segoe UI", sans-serif';
     let bottom = 'BEST ROUND  ' + bestRound;
     if (streak > 1) bottom += '    \u00B7    STREAK  x' + Math.min(streak, 3);
+    if (power.kind && POWER_INFO[power.kind]) bottom += '    \u00B7    ' + POWER_INFO[power.kind].label;
     bctx.fillText(bottom, 256, 232);
     boardTex.needsUpdate = true;
   }
@@ -595,40 +791,40 @@
     return { canvas: c, ctx: c.getContext('2d'), tex: new THREE.CanvasTexture(c) };
   }
 
-  const padL = makeLabel(256, 128);
+  const padL = makeLabel(512, 256);
   function drawPad(label1, label2) {
     const x = padL.ctx;
-    x.clearRect(0, 0, 256, 128);
-    x.fillStyle = 'rgba(9, 26, 42, 0.95)';
-    x.fillRect(0, 0, 256, 128);
+    x.clearRect(0, 0, 512, 256);
+    x.fillStyle = 'rgba(9, 26, 42, 0.98)';
+    x.fillRect(0, 0, 512, 256);
     x.strokeStyle = '#7fe0b0';
-    x.lineWidth = 5;
-    x.strokeRect(3, 3, 250, 122);
+    x.lineWidth = 10;
+    x.strokeRect(6, 6, 500, 244);
     x.textAlign = 'center';
     x.fillStyle = '#7fe0b0';
-    x.font = '700 44px "Segoe UI", sans-serif';
-    x.fillText(label1, 128, 58);
+    x.font = '700 96px "Segoe UI", sans-serif';
+    x.fillText(label1, 256, 118);
     x.fillStyle = '#9fe8f2';
-    x.font = '600 24px "Segoe UI", sans-serif';
-    x.fillText(label2, 128, 98);
+    x.font = '600 44px "Segoe UI", sans-serif';
+    x.fillText(label2, 256, 198);
     padL.tex.needsUpdate = true;
   }
 
-  const exitL = makeLabel(256, 96);
+  const exitL = makeLabel(512, 192);
   (function drawExit() {
     const x = exitL.ctx;
-    x.fillStyle = 'rgba(42, 12, 16, 0.95)';
-    x.fillRect(0, 0, 256, 96);
+    x.fillStyle = 'rgba(42, 12, 16, 0.98)';
+    x.fillRect(0, 0, 512, 192);
     x.strokeStyle = '#e07f7f';
-    x.lineWidth = 5;
-    x.strokeRect(3, 3, 250, 90);
+    x.lineWidth = 10;
+    x.strokeRect(6, 6, 500, 180);
     x.textAlign = 'center';
     x.fillStyle = '#e89a9a';
-    x.font = '700 40px "Segoe UI", sans-serif';
-    x.fillText('EXIT', 128, 45);
+    x.font = '700 84px "Segoe UI", sans-serif';
+    x.fillText('EXIT', 256, 92);
     x.fillStyle = '#d8b0b0';
-    x.font = '600 20px "Segoe UI", sans-serif';
-    x.fillText('back to menu', 128, 78);
+    x.font = '600 40px "Segoe UI", sans-serif';
+    x.fillText('back to menu', 256, 156);
     exitL.tex.needsUpdate = true;
   })();
 
@@ -647,13 +843,13 @@
   kiosk.add(pillar);
 
   const beacon = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.045, 0.045, 3.2, 12, 1, true),
+    new THREE.CylinderGeometry(0.045, 0.045, 1.7, 12, 1, true),
     new THREE.MeshBasicMaterial({
       color: 0x7fe0b0, transparent: true, opacity: 0.16,
       side: THREE.DoubleSide, depthWrite: false
     })
   );
-  beacon.position.y = 1.6;
+  beacon.position.y = 2.45;   // starts above the sign panels — no more glow over the text
   kiosk.add(beacon);
 
   const billboard = new THREE.Group();
@@ -672,7 +868,7 @@
     new THREE.PlaneGeometry(0.6, 0.3),
     new THREE.MeshBasicMaterial({ map: padL.tex, transparent: true })
   );
-  padLabel.position.z = 0.045;
+  padLabel.position.z = 0.055;
   billboard.add(padLabel);
 
   const exitBox = new THREE.Mesh(
@@ -688,7 +884,7 @@
     new THREE.PlaneGeometry(0.44, 0.165),
     new THREE.MeshBasicMaterial({ map: exitL.tex, transparent: true })
   );
-  exitLabel.position.set(0, -0.42, 0.04);
+  exitLabel.position.set(0, -0.42, 0.05);
   billboard.add(exitLabel);
 
   // ---------- Round control ----------
@@ -707,6 +903,8 @@
     tone(440, 0.09, 'sine', 0.3);
     tone(660, 0.09, 'sine', 0.3, null, 0.1);
     tone(880, 0.14, 'sine', 0.3, null, 0.2);
+    say('Round start. Sixty seconds.');
+    if (net.mode === 'host') netSend({ t: 'e', k: 'round' });
   }
 
   function endRound() {
@@ -724,11 +922,14 @@
       tone(988, 0.1, 'sine', 0.35, null, 0.1);
       tone(1175, 0.12, 'sine', 0.35, null, 0.2);
       tone(1568, 0.28, 'sine', 0.32, null, 0.3);
+      say('Time up. New best: ' + roundScore + ' points!');
     } else {
       tone(196, 0.45, 'square', 0.35);
       tone(147, 0.65, 'square', 0.35, null, 0.06);
+      say('Time up. Final score ' + roundScore + '.');
     }
     for (const c of controllers) pulse(c, 0.7, 250);
+    if (net.mode === 'host') netSend({ t: 'e', k: 'end', rs: lastRoundScore, nb: isNewBest });
   }
 
   // ---------- Score burst particles ----------
@@ -761,20 +962,29 @@
   function onScore(g) {
     g.userData.scored = true;
     streak++;
-    const pts = Math.min(streak, 3) * (hoopGolden ? 2 : 1);
+    let pts = Math.min(streak, 3) * (hoopGolden ? 2 : 1);
+    if (power.kind === 'double') pts *= 2;
     if (mode === 'round') roundScore += pts; else freeScore += pts;
     const wasGolden = hoopGolden;
-    spawnPopup('+' + pts, hoop.position.clone(), wasGolden ? '#e8c76f' : '#7fe0b0');
-    spawnBurst(hoop.position.clone(), wasGolden ? 0xe8c76f : g.material.color.getHex());
+    const sp = hoop.position.clone();
+    spawnPopup('+' + pts, sp, wasGolden ? '#e8c76f' : '#7fe0b0');
+    spawnBurst(sp, wasGolden ? 0xe8c76f : g.material.color.getHex());
     drawBoard();
     ensureAudio();
-    tone(660, 0.12, 'sine', 0.35);
-    tone(880, 0.14, 'sine', 0.35, null, 0.09);
-    tone(1320, 0.2, 'sine', 0.3, null, 0.18);
-    if (pts > 1) tone(1760, 0.16, 'sine', 0.22, null, 0.27);
+    tone(660, 0.12, 'sine', 0.35, null, 0, sp);
+    tone(880, 0.14, 'sine', 0.35, null, 0.09, sp);
+    tone(1320, 0.2, 'sine', 0.3, null, 0.18, sp);
+    if (pts > 1) tone(1760, 0.16, 'sine', 0.22, null, 0.27, sp);
+    if (streak === 3) say('Triple streak!');
     for (const c of controllers) pulse(c, 0.8, 120);
     const goldenChance = (mode === 'round' && timeLeft <= 15) ? 0.5 : 0.22;
     placeHoop(Math.random() < goldenChance);
+    if (g.userData.charged) {
+      g.userData.charged = false;
+      power.chargeIdx = -1;
+      activatePower(sp);
+    }
+    if (net.mode === 'host') netSend({ t: 'e', k: 'score', pts: pts, golden: wasGolden, sp: [sp.x, sp.y, sp.z], st: streak });
   }
 
   function settleOrb(g) {
@@ -828,22 +1038,28 @@
     return hits.length ? hits[0].object : null;
   }
 
-  function aimAssist(vel, from) {
-    if (vel.length() < 1.2) return vel;
-    const toHoop = hoop.position.clone().sub(from);
-    if (toHoop.length() < 0.5) return vel;
-    toHoop.normalize();
+  function aimAssist(vel, from, isHand) {
+    const speed = vel.length();
+    if (speed < 1.2) return vel;
+    const disp = hoop.position.clone().sub(from);
+    const dist = disp.length();
+    if (dist < 0.5) return vel;
+    // Ballistic compensation: aim above the ring by the expected gravity drop
+    const tf = dist / speed;
+    const drop = Math.min(1.2, 0.5 * 3.2 * tf * tf);
+    disp.y += drop;
+    disp.normalize();
     const dir = vel.clone().normalize();
-    const angle = dir.angleTo(toHoop);
-    if (angle < THREE.MathUtils.degToRad(18)) {
-      const blended = dir.lerp(toHoop, 0.3).normalize();
-      return blended.multiplyScalar(vel.length());
+    const cone = THREE.MathUtils.degToRad(isHand ? 30 : 18);
+    if (dir.angleTo(disp) < cone) {
+      const blended = dir.lerp(disp, isHand ? 0.5 : 0.3).normalize();
+      return blended.multiplyScalar(speed);
     }
     return vel;
   }
 
-  function releaseObject(held, throwVelocity) {
-    held.userData.velocity.copy(aimAssist(throwVelocity, held.position));
+  function releaseObject(held, throwVelocity, isHand) {
+    held.userData.velocity.copy(aimAssist(throwVelocity, held.position, isHand));
     held.userData.free = true;
     held.userData.heldBy = null;
     held.userData.thrown = true;
@@ -861,7 +1077,8 @@
     if (ctrl.userData.held) return;
     const hover = findHover(ctrl);
     if (hover === padBox) {
-      startRound();
+      if (net.mode === 'guest') netSend({ t: 'pad' });
+      else startRound();
       pulse(ctrl, 0.5, 80);
       return;
     }
@@ -891,21 +1108,33 @@
     target.material.emissiveIntensity = 0.8;
     pulse(ctrl, 0.6, 60);
     tone(440, 0.1, 'sine', 0.3, 620);
+    if (net.mode === 'guest') netSend({ t: 'g', i: grabbables.indexOf(target) });
   }
 
   function onGrabEnd(ctrl) {
     const held = ctrl.userData.held;
     if (!held) return;
     const src = ctrl.userData.inputSource;
+    const isHand = !!(src && src.hand);
     let vel;
-    if (src && src.hand) {
+    if (isHand) {
       const h = handStates[src.handedness];
-      vel = (h && h.sampler.buf.length > 1) ? h.sampler.vel(0.09) : ctrl.userData.sampler.vel(0.09);
+      vel = (h && h.sampler.buf.length > 1)
+        ? h.sampler.velPeak(0.18, 0.06)
+        : ctrl.userData.sampler.velPeak(0.18, 0.06);
       vel.multiplyScalar(HAND_THROW_MULT);
     } else {
       vel = ctrl.userData.sampler.vel(0.09).multiplyScalar(CTRL_THROW_MULT);
     }
-    releaseObject(held, vel);
+    if (net.mode === 'guest') {
+      const gi = grabbables.indexOf(held);
+      held.userData.heldBy = null;
+      netSend({ t: 'r', i: gi, v: [vel.x, vel.y, vel.z], hand: isHand });
+      ensureAudio();
+      tone(380, 0.08, 'sine', 0.2, 300);
+    } else {
+      releaseObject(held, vel, isHand);
+    }
     ctrl.userData.held = null;
     pulse(ctrl, 0.3, 40);
   }
@@ -933,7 +1162,7 @@
     });
     ctrl.addEventListener('disconnected', () => {
       if (ctrl.userData.held) {
-        releaseObject(ctrl.userData.held, new THREE.Vector3());
+        releaseObject(ctrl.userData.held, new THREE.Vector3(), false);
         ctrl.userData.held = null;
       }
       ctrl.userData.inputSource = null;
@@ -969,9 +1198,24 @@
       group.add(m);
       return m;
     });
+    const boneIdx = [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8], [8, 9],
+      [0, 10], [10, 11], [11, 12], [12, 13], [13, 14],
+      [0, 15], [15, 16], [16, 17], [17, 18], [18, 19],
+      [0, 20], [20, 21], [21, 22], [22, 23], [23, 24]
+    ];
+    const boneArr = new Float32Array(boneIdx.length * 6);
+    const boneGeo = new THREE.BufferGeometry();
+    boneGeo.setAttribute('position', new THREE.BufferAttribute(boneArr, 3));
+    const bones = new THREE.LineSegments(boneGeo, new THREE.LineBasicMaterial({
+      color: 0x4fd6e8, transparent: true, opacity: 0.55, depthWrite: false
+    }));
+    bones.frustumCulled = false;
+    group.add(bones);
     rig.add(group);
     return {
-      group, jointMeshes,
+      group, jointMeshes, boneIdx, boneArr, bones,
       pinchWorld: new THREE.Vector3(),
       pinchValid: false,
       sampler: makeSampler()
@@ -1003,6 +1247,19 @@
             mesh.visible = false;
           }
         }
+
+        // Connect the joints into a visible skeleton
+        const ba = h.boneArr;
+        for (let b2 = 0; b2 < h.boneIdx.length; b2++) {
+          const m0 = h.jointMeshes[h.boneIdx[b2][0]];
+          const m1 = h.jointMeshes[h.boneIdx[b2][1]];
+          const ok = m0.visible && m1.visible;
+          const p0 = ok ? m0.position : h.jointMeshes[0].position;
+          const p1 = ok ? m1.position : h.jointMeshes[0].position;
+          ba[b2 * 6] = p0.x; ba[b2 * 6 + 1] = p0.y; ba[b2 * 6 + 2] = p0.z;
+          ba[b2 * 6 + 3] = p1.x; ba[b2 * 6 + 4] = p1.y; ba[b2 * 6 + 5] = p1.z;
+        }
+        h.bones.geometry.attributes.position.needsUpdate = true;
 
         const thumbPose = frame.getJointPose(source.hand.get('thumb-tip'), refSpace);
         const indexPose = frame.getJointPose(source.hand.get('index-finger-tip'), refSpace);
@@ -1122,7 +1379,9 @@
       g.userData.thrown = false;
       g.userData.scored = false;
       g.userData.trail.visible = false;
+      g.userData.charged = false;
     }
+    power.chargeIdx = -1;
     if (!silent) { ensureAudio(); tone(240, 0.12, 'sine', 0.2, 180); }
   }
 
@@ -1160,16 +1419,18 @@
 
       const b = gp.buttons;
       if (b && b.length > 4 && b[4]) {
-        if (aReady && b[4].pressed) { resetOrbs(false); aReady = false; }
+        if (aReady && b[4].pressed) { if (isAuthority()) resetOrbs(false); aReady = false; }
         else if (!b[4].pressed) aReady = true;
       }
       if (b && b.length > 5 && b[5]) {
         if (bReady && b[5].pressed) {
-          freeScore = 0; roundScore = 0; bestRound = 0; streak = 0;
-          lastRoundScore = 0; finalFlash = 0;
-          saveBest();
-          if (mode === 'round') { mode = 'free'; drawPad('START', '60 sec round'); }
-          drawBoard();
+          if (isAuthority()) {
+            freeScore = 0; roundScore = 0; bestRound = 0; streak = 0;
+            lastRoundScore = 0; finalFlash = 0;
+            saveBest();
+            if (mode === 'round') { mode = 'free'; drawPad('START', '60 sec round'); }
+            drawBoard();
+          }
           bReady = false;
         } else if (!b[5].pressed) bReady = true;
       }
@@ -1193,6 +1454,363 @@
     px = e.clientX; py = e.clientY;
     camera.rotation.set(pitch, yaw, 0, 'YXZ');
   });
+
+  // ---------- Multiplayer (PeerJS over WebRTC — host authoritative, co-op score) ----------
+  const net = {
+    mode: 'solo',            // 'solo' | 'host' | 'guest'
+    peer: null, conn: null, code: '',
+    tick: 0, poseTick: 0, lastCeil: -1,
+    orbTargets: grabbables.map(g => g.position.clone()),
+    hoopTarget: new THREE.Vector3(),
+    lastGolden: false, lastBoard: '', lastPk: '',
+    guestHeld: -1            // host-side: orb index held by the remote guest
+  };
+  function isAuthority() { return net.mode !== 'guest'; }
+
+  // Remote player avatar: gold visor head + floating hands
+  const avatar = new THREE.Group();
+  avatar.visible = false;
+  const avHead = new THREE.Mesh(
+    new THREE.BoxGeometry(0.2, 0.12, 0.14),
+    new THREE.MeshStandardMaterial({ color: 0x123047, emissive: 0xe8c76f, emissiveIntensity: 0.25, roughness: 0.4, metalness: 0.3 })
+  );
+  const avVisor = new THREE.Mesh(
+    new THREE.BoxGeometry(0.16, 0.045, 0.02),
+    new THREE.MeshBasicMaterial({ color: 0xe8c76f })
+  );
+  avVisor.position.set(0, 0.01, -0.075);
+  avHead.add(avVisor);
+  avatar.add(avHead);
+  const avHands = [0, 1].map(() => {
+    const m = new THREE.Mesh(
+      new THREE.SphereGeometry(0.045, 12, 10),
+      new THREE.MeshStandardMaterial({ color: 0xe8c76f, emissive: 0xe8c76f, emissiveIntensity: 0.35, roughness: 0.4 })
+    );
+    m.visible = false;
+    avatar.add(m);
+    return m;
+  });
+  scene.add(avatar);
+
+  const mpStatus = document.getElementById('mpStatus');
+  const hostBtn = document.getElementById('hostBtn');
+  const joinBtn = document.getElementById('joinBtn');
+  const joinCode = document.getElementById('joinCode');
+  function setStatus(s) { if (mpStatus) mpStatus.textContent = s; }
+
+  function netSend(obj) {
+    if (net.conn && net.conn.open) { try { net.conn.send(obj); } catch (e) {} }
+  }
+
+  function sharedState(kind) {
+    return {
+      t: kind,
+      o: grabbables.map(g => [+g.position.x.toFixed(3), +g.position.y.toFixed(3), +g.position.z.toFixed(3)]),
+      hp: [+hoop.position.x.toFixed(3), +hoop.position.y.toFixed(3), +hoop.position.z.toFixed(3)],
+      hg: hoopGolden, fs: freeScore, rs: roundScore, st: streak,
+      md: mode, tl: +timeLeft.toFixed(2), bs: bestRound,
+      pk: power.kind, ci: power.chargeIdx
+    };
+  }
+
+  function applyShared(m) {
+    for (let i = 0; i < grabbables.length && i < m.o.length; i++) net.orbTargets[i].fromArray(m.o[i]);
+    net.hoopTarget.fromArray(m.hp);
+    if (m.hg && !net.lastGolden) {
+      ensureAudio();
+      tone(1568, 0.1, 'sine', 0.25, null, 0, net.hoopTarget);
+      say('Gold ring!');
+    }
+    net.lastGolden = m.hg;
+    hoopGolden = m.hg;
+    const col = hoopGolden ? 0xe8c76f : 0x7fe0b0;
+    hoop.material.color.set(col); hoop.material.emissive.set(col);
+    const pk = m.pk || '';
+    if (pk && pk !== net.lastPk && POWER_INFO[pk]) say(POWER_INFO[pk].voice);
+    net.lastPk = pk;
+    power.kind = pk;
+    updateHoopScale();
+    const gci = (typeof m.ci === 'number') ? m.ci : -1;
+    if (gci !== power.chargeIdx) {
+      clearCharge();
+      if (gci >= 0 && grabbables[gci]) { power.chargeIdx = gci; grabbables[gci].userData.charged = true; }
+    }
+    const wasMode = mode;
+    freeScore = m.fs; roundScore = m.rs; streak = m.st;
+    mode = m.md; timeLeft = m.tl; bestRound = m.bs;
+    const ceil = Math.max(0, Math.ceil(m.tl));
+    if (mode === 'round' && ceil !== net.lastCeil) {
+      if (ceil === 15) { ensureAudio(); tone(740, 0.1, 'square', 0.3); say('Frenzy!'); }
+      else if (ceil === 10) say('Ten seconds.');
+      else if (ceil >= 1 && ceil <= 5) { ensureAudio(); tone(950, 0.06, 'square', 0.25); }
+    }
+    net.lastCeil = ceil;
+    const key = [m.fs, m.rs, m.st, m.md, ceil, m.bs, pk].join('|');
+    if (key !== net.lastBoard) { net.lastBoard = key; drawBoard(); }
+    if (mode === 'round' && wasMode !== 'round') drawPad('RESTART', 'round running');
+    if (mode === 'free' && wasMode === 'round') drawPad('START', '60 sec round');
+  }
+
+  function applyPose(m) {
+    avatar.visible = true;
+    net.lastPoseT = clock.elapsedTime;
+    avHead.position.set(m.h[0], m.h[1], m.h[2]);
+    avHead.quaternion.set(m.h[3], m.h[4], m.h[5], m.h[6]);
+    for (let k = 0; k < 2; k++) {
+      const hp = k === 0 ? m.l : m.r;
+      if (hp) { avHands[k].visible = true; avHands[k].position.set(hp[0], hp[1], hp[2]); }
+      else avHands[k].visible = false;
+    }
+    if (isAuthority()) {
+      if (m.g >= 0 && m.g < grabbables.length) {
+        const orb = grabbables[m.g];
+        if (!orb.userData.heldBy || orb.userData.heldBy === 'guest') {
+          orb.userData.heldBy = 'guest';
+          orb.userData.free = false;
+          net.guestHeld = m.g;
+          if (m.gp) orb.position.set(m.gp[0], m.gp[1], m.gp[2]);
+        }
+      } else if (net.guestHeld >= 0 && m.g === -1) {
+        const orb = grabbables[net.guestHeld];
+        if (orb.userData.heldBy === 'guest') orb.userData.heldBy = null;
+        net.guestHeld = -1;
+      }
+    }
+  }
+
+  function guestLocalHeldIdx() {
+    for (const c of controllers) if (c.userData.held) return grabbables.indexOf(c.userData.held);
+    return -1;
+  }
+
+  function sendPose() {
+    camera.getWorldQuaternion(tmpQ);
+    const msg = {
+      t: 'p',
+      h: [+camPos.x.toFixed(3), +camPos.y.toFixed(3), +camPos.z.toFixed(3),
+          +tmpQ.x.toFixed(3), +tmpQ.y.toFixed(3), +tmpQ.z.toFixed(3), +tmpQ.w.toFixed(3)],
+      l: 0, r: 0, g: -1, gp: 0
+    };
+    for (const c of controllers) {
+      const src = c.userData.inputSource;
+      if (!src) continue;
+      c.getWorldPosition(tmpV);
+      const arr = [+tmpV.x.toFixed(3), +tmpV.y.toFixed(3), +tmpV.z.toFixed(3)];
+      if (src.handedness === 'left') msg.l = arr;
+      else if (src.handedness === 'right') msg.r = arr;
+    }
+    if (net.mode === 'guest') {
+      const gi = guestLocalHeldIdx();
+      msg.g = gi;
+      if (gi >= 0) {
+        const o = grabbables[gi];
+        msg.gp = [+o.position.x.toFixed(3), +o.position.y.toFixed(3), +o.position.z.toFixed(3)];
+      }
+    }
+    netSend(msg);
+  }
+
+  function onNetMessage(m) {
+    if (!m || !m.t) return;
+    if (m.t === 'p') { applyPose(m); return; }
+    if (net.mode === 'guest') {
+      if (m.t === 's' || m.t === 'init') {
+        if (m.t === 'init') {
+          for (let i = 0; i < grabbables.length && i < m.o.length; i++) grabbables[i].position.fromArray(m.o[i]);
+        }
+        applyShared(m);
+      } else if (m.t === 'e') {
+        if (m.k === 'score') {
+          tmpV.set(m.sp[0], m.sp[1], m.sp[2]);
+          spawnPopup('+' + m.pts, tmpV.clone(), m.golden ? '#e8c76f' : '#7fe0b0');
+          spawnBurst(tmpV.clone(), m.golden ? 0xe8c76f : 0x7fe0b0);
+          ensureAudio();
+          tone(660, 0.12, 'sine', 0.35, null, 0, tmpV);
+          tone(880, 0.14, 'sine', 0.35, null, 0.09, tmpV);
+          tone(1320, 0.2, 'sine', 0.3, null, 0.18, tmpV);
+          if (m.st === 3) say('Triple streak!');
+        } else if (m.k === 'round') {
+          resetOrbs(true);
+          finalFlash = 0;
+          drawPad('RESTART', 'round running');
+          ensureAudio();
+          tone(440, 0.09, 'sine', 0.3);
+          tone(660, 0.09, 'sine', 0.3, null, 0.1);
+          tone(880, 0.14, 'sine', 0.3, null, 0.2);
+          say('Round start. Sixty seconds.');
+        } else if (m.k === 'end') {
+          lastRoundScore = m.rs;
+          finalFlash = 4;
+          drawPad('START', '60 sec round');
+          ensureAudio();
+          if (m.nb) {
+            say('Time up. New best: ' + m.rs + ' points!');
+          } else {
+            tone(196, 0.45, 'square', 0.35);
+            say('Time up. Final score ' + m.rs + '.');
+          }
+        }
+      }
+    } else {
+      // Host receiving guest requests
+      if (m.t === 'g') {
+        const orb = grabbables[m.i];
+        if (orb && !orb.userData.heldBy) {
+          orb.userData.heldBy = 'guest';
+          orb.userData.free = false;
+          orb.userData.velocity.set(0, 0, 0);
+          orb.userData.prevHoopZ = null;
+          orb.userData.trail.visible = false;
+          net.guestHeld = m.i;
+        }
+      } else if (m.t === 'r') {
+        const orb = grabbables[m.i];
+        if (orb && orb.userData.heldBy === 'guest') {
+          orb.userData.heldBy = null;
+          net.guestHeld = -1;
+          tmpV.set(m.v[0], m.v[1], m.v[2]);
+          releaseObject(orb, tmpV.clone(), !!m.hand);
+        }
+      } else if (m.t === 'pad') {
+        startRound();
+      }
+    }
+  }
+
+  function wireConn(conn) {
+    net.conn = conn;
+    conn.on('data', onNetMessage);
+    conn.on('open', () => {
+      setStatus(net.mode === 'host' ? 'Player 2 connected!' : 'Connected to host!');
+      spawnPopup(net.mode === 'host' ? 'P2 JOINED' : 'CONNECTED',
+        camPos.clone().add(new THREE.Vector3(0, 0.2, -1)), '#e8c76f');
+      say(net.mode === 'host' ? 'Player two joined.' : 'Connected.');
+      if (net.mode === 'host') netSend(sharedState('init'));
+    });
+    conn.on('close', () => {
+      avatar.visible = false;
+      if (net.mode === 'guest') {
+        net.mode = 'solo';
+        for (const g of grabbables) if (g.userData.heldBy === 'guest') g.userData.heldBy = null;
+        setStatus('Host left \u2014 back to solo.');
+        say('Host left. Solo mode.');
+      } else {
+        if (net.guestHeld >= 0 && grabbables[net.guestHeld].userData.heldBy === 'guest') {
+          grabbables[net.guestHeld].userData.heldBy = null;
+        }
+        net.guestHeld = -1;
+        net.conn = null;
+        setStatus('Player 2 left. Code still active: ' + net.code);
+      }
+    });
+    conn.on('error', () => setStatus('Connection error.'));
+  }
+
+  function hostGame() {
+    if (typeof Peer === 'undefined') { setStatus('Multiplayer library blocked \u2014 check internet.'); return; }
+    if (net.peer) { try { net.peer.destroy(); } catch (e) {} }
+    const code = Array.from({ length: 4 }, () => 'ABCDEFGHJKMNPQRSTUVWXYZ'[Math.floor(Math.random() * 23)]).join('');
+    net.code = code;
+    setStatus('Creating room\u2026');
+    const p = new Peer('orbtoss-' + code);
+    net.peer = p;
+    p.on('open', () => { net.mode = 'host'; setStatus('CODE: ' + code + ' \u2014 waiting for Player 2\u2026'); });
+    p.on('connection', (c) => wireConn(c));
+    p.on('error', (e) => {
+      if (e && e.type === 'unavailable-id') hostGame();
+      else setStatus('Network error \u2014 check internet.');
+    });
+  }
+
+  function joinGame() {
+    if (typeof Peer === 'undefined') { setStatus('Multiplayer library blocked \u2014 check internet.'); return; }
+    const code = ((joinCode && joinCode.value) || '').trim().toUpperCase();
+    if (code.length !== 4) { setStatus('Enter the 4-letter code.'); return; }
+    if (net.peer) { try { net.peer.destroy(); } catch (e) {} }
+    setStatus('Joining ' + code + '\u2026');
+    const p = new Peer();
+    net.peer = p;
+    p.on('open', () => {
+      net.mode = 'guest';
+      wireConn(p.connect('orbtoss-' + code, { reliable: true }));
+    });
+    p.on('error', () => setStatus('Could not reach host \u2014 check the code.'));
+  }
+
+  if (hostBtn) hostBtn.addEventListener('click', hostGame);
+  if (joinBtn) joinBtn.addEventListener('click', joinGame);
+
+  function netUpdate(dt) {
+    if (net.mode === 'solo' || !net.conn || !net.conn.open) return;
+    net.poseTick += dt;
+    if (net.poseTick >= 0.05) {
+      net.poseTick = 0;
+      if (renderer.xr.isPresenting) sendPose();
+    }
+    if (net.mode === 'host') {
+      net.tick += dt;
+      if (net.tick >= 0.05) { net.tick = 0; netSend(sharedState('s')); }
+    } else {
+      // Guest: glide shared objects toward the host's latest snapshot
+      const heldIdx = guestLocalHeldIdx();
+      for (let i = 0; i < grabbables.length; i++) {
+        if (i === heldIdx) continue;
+        grabbables[i].position.lerp(net.orbTargets[i], Math.min(1, dt * 14));
+      }
+      hoop.position.lerp(net.hoopTarget, Math.min(1, dt * 14));
+      hoop.updateMatrixWorld(true);
+    }
+  }
+
+  // ---------- Spectator mode (desktop guest = live audience screen) ----------
+  const specOverlay = document.getElementById('specOverlay');
+  const specScore = document.getElementById('specScore');
+  const specLine = document.getElementById('specLine');
+  const spectate = { auto: true, angle: 0.6, ovTick: 0, wasActive: false };
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'c' || e.key === 'C') spectate.auto = true;
+  });
+  renderer.domElement.addEventListener('pointerdown', () => { spectate.auto = false; });
+
+  function spectatorActive() {
+    return net.mode === 'guest' && !renderer.xr.isPresenting && net.conn && net.conn.open;
+  }
+
+  function updateSpectator(dt, t) {
+    const active = spectatorActive();
+    if (specOverlay) specOverlay.style.display = active ? 'flex' : 'none';
+    const hud = document.getElementById('hud');
+    if (hud) hud.style.display = active ? 'none' : '';
+    if (!active) { spectate.wasActive = false; return; }
+    if (!spectate.wasActive) { spectate.wasActive = true; spectate.auto = true; }
+
+    if (spectate.auto) {
+      spectate.angle += dt * 0.1;
+      // Focus drifts between the arena centre, the ring, and the player's head
+      tmpV.set(0, 1.4, 0).multiplyScalar(0.25).addScaledVector(hoop.position, 0.45);
+      if (avatar.visible) tmpV.addScaledVector(avHead.position, 0.3);
+      else { tmpUp.set(0, 1.6, 0); tmpV.addScaledVector(tmpUp, 0.3); }
+      const r = 5.4;
+      camera.position.set(
+        tmpV.x + Math.cos(spectate.angle) * r,
+        2.4 + Math.sin(t * 0.3) * 0.3,
+        tmpV.z + Math.sin(spectate.angle) * r
+      );
+      camera.lookAt(tmpV);
+    }
+
+    spectate.ovTick += dt;
+    if (spectate.ovTick > 0.25) {
+      spectate.ovTick = 0;
+      if (specScore) specScore.textContent = String(mode === 'round' ? roundScore : freeScore);
+      if (specLine) {
+        specLine.textContent = mode === 'round'
+          ? ('\u25CF LIVE \u00B7 ' + Math.max(0, Math.ceil(timeLeft)) + 's'
+             + (streak > 1 ? ' \u00B7 STREAK x' + Math.min(streak, 3) : ''))
+          : ('\u25CF LIVE \u00B7 FREE PLAY \u00B7 BEST ' + bestRound);
+      }
+    }
+  }
 
   // ---------- Enter VR / Mixed Reality ----------
   const btnVR = document.getElementById('enterVR');
@@ -1230,6 +1848,7 @@
       clearRoom();
       rig.position.set(0, 0, 0);
       rig.rotation.set(0, 0, 0);
+      if (net.mode === 'guest' && !arMode) rig.position.x = 1.2;
       btnVR.textContent = 'Exit';
       btnAR.textContent = 'Exit';
       session.addEventListener('end', () => {
@@ -1256,15 +1875,33 @@
   renderer.setAnimationLoop((time, frame) => {
     const dt = Math.min(clock.getDelta(), 0.05);
     const t = clock.elapsedTime;
+    const pdt = (isAuthority() && power.kind === 'slow') ? dt * 0.4 : dt;
 
     camera.getWorldPosition(camPos);
 
-    if (mode === 'round') {
+    // Keep the 3D-audio listener locked to the headset
+    if (audioCtx && audioCtx.listener) {
+      camera.getWorldQuaternion(tmpQ);
+      camFwd.set(0, 0, -1).applyQuaternion(tmpQ);
+      tmpUp.set(0, 1, 0).applyQuaternion(tmpQ);
+      const L = audioCtx.listener;
+      if (L.positionX) {
+        L.positionX.value = camPos.x; L.positionY.value = camPos.y; L.positionZ.value = camPos.z;
+        L.forwardX.value = camFwd.x; L.forwardY.value = camFwd.y; L.forwardZ.value = camFwd.z;
+        L.upX.value = tmpUp.x; L.upY.value = tmpUp.y; L.upZ.value = tmpUp.z;
+      } else {
+        if (L.setPosition) L.setPosition(camPos.x, camPos.y, camPos.z);
+        if (L.setOrientation) L.setOrientation(camFwd.x, camFwd.y, camFwd.z, tmpUp.x, tmpUp.y, tmpUp.z);
+      }
+    }
+
+    if (isAuthority() && mode === 'round') {
       timeLeft -= dt;
       const s = Math.ceil(timeLeft);
       if (s !== lastTickSecond) {
         lastTickSecond = s;
-        if (s === 15) { ensureAudio(); tone(740, 0.1, 'square', 0.3); tone(740, 0.1, 'square', 0.3, null, 0.15); }
+        if (s === 15) { ensureAudio(); tone(740, 0.1, 'square', 0.3); tone(740, 0.1, 'square', 0.3, null, 0.15); say('Frenzy!'); }
+        if (s === 10) say('Ten seconds.');
         if (s >= 1 && s <= 5) { ensureAudio(); tone(950, 0.06, 'square', 0.25); }
         drawBoard();
       }
@@ -1278,18 +1915,31 @@
 
     if (revealTimer > 0) revealTimer -= dt;
 
-    if (hoopGolden) {
-      goldenTimer -= dt;
-      if (goldenTimer <= 0) placeHoop(false);
-    }
+    if (isAuthority()) {
+      if (power.kind) {
+        power.timer -= dt;
+        if (power.timer <= 0) expirePower();
+      }
+      power.chargeTimer -= dt;
+      if (power.chargeTimer <= 0) {
+        power.chargeTimer = 14 + Math.random() * 8;
+        if (power.chargeIdx < 0 && !power.kind) chargeRandomOrb();
+      }
 
-    const driftAmp = (mode === 'round' && roundScore >= 6)
-      ? Math.min(0.7, 0.25 + roundScore * 0.03) : 0;
-    const driftSpeed = 1.2 + roundScore * 0.05;
-    hoop.position.copy(hoopAnchor)
-      .addScaledVector(hoopTangent, driftAmp > 0 ? Math.sin(t * driftSpeed) * driftAmp : 0);
-    hoop.position.y = hoopAnchor.y + Math.sin(t * 1.4) * 0.05;
-    hoop.updateMatrixWorld(true);
+      if (hoopGolden) {
+        goldenTimer -= dt;
+        if (goldenTimer <= 0) placeHoop(false);
+      }
+
+      let driftAmp = (mode === 'round' && roundScore >= 6)
+        ? Math.min(0.7, 0.25 + roundScore * 0.03) : 0;
+      if (passthrough) driftAmp = Math.min(driftAmp, 0.35);
+      const driftSpeed = 1.2 + roundScore * 0.05;
+      hoop.position.copy(hoopAnchor)
+        .addScaledVector(hoopTangent, driftAmp > 0 ? Math.sin(t * driftSpeed) * driftAmp : 0);
+      hoop.position.y = hoopAnchor.y + Math.sin(t * 1.4) * 0.05;
+      hoop.updateMatrixWorld(true);
+    }
     hoop.material.emissiveIntensity = 0.5 + Math.sin(t * (hoopGolden ? 5 : 2.5)) * 0.2;
 
     billboard.rotation.y = Math.atan2(camPos.x - PAD_POS.x, camPos.z - PAD_POS.z);
@@ -1343,16 +1993,30 @@
     padBox.material.emissiveIntensity = padHovered ? 0.9 : (0.3 + Math.sin(t * 2) * 0.1);
     exitBox.material.emissiveIntensity = exitHovered ? 0.8 : 0.25;
 
-    if (renderer.xr.isPresenting) handleLocomotion();
+    // Charged orbs pulse and swell
+    for (let ci2 = 0; ci2 < grabbables.length; ci2++) {
+      const cg = grabbables[ci2];
+      if (cg.userData.charged) {
+        cg.material.emissiveIntensity = 0.55 + Math.sin(t * 6) * 0.3;
+        cg.scale.setScalar(1 + 0.08 * Math.sin(t * 5));
+      } else if (cg.scale.x !== 1) {
+        cg.scale.setScalar(1);
+      }
+    }
 
-    for (const g of grabbables) {
+    if (renderer.xr.isPresenting) handleLocomotion();
+    netUpdate(dt);
+    if (avatar.visible && t - (net.lastPoseT || 0) > 1.5) avatar.visible = false;
+    updateSpectator(dt, t);
+
+    if (isAuthority()) for (const g of grabbables) {
       const u = g.userData;
       if (u.heldBy) continue;
 
       if (u.free) {
         prevWorld.copy(g.position);
-        u.velocity.y += GRAVITY * dt;
-        g.position.addScaledVector(u.velocity, dt);
+        u.velocity.y += GRAVITY * pdt;
+        g.position.addScaledVector(u.velocity, pdt);
         pushTrail(g);
 
         if (g.position.y < 0.15) {
@@ -1361,15 +2025,15 @@
           u.velocity.y *= -0.55;
           u.velocity.x *= 0.8;
           u.velocity.z *= 0.8;
-          if (impact > 0.6) tone(95 + Math.random() * 40, 0.12, 'triangle', Math.min(0.45, impact * 0.06));
+          if (impact > 0.6) tone(95 + Math.random() * 40, 0.12, 'triangle', Math.min(0.45, impact * 0.06), null, 0, g.position);
           if (u.velocity.length() < 0.4) settleOrb(g);
         }
         if (u.free && passthrough && planeCtx.size > 0) collideRoom(g, u);
         if (u.free && g.position.length() > 8.5) settleOrb(g);
 
         if (u.free) {
-          g.rotation.x += u.spin.x * dt * 3;
-          g.rotation.y += u.spin.y * dt * 3;
+          g.rotation.x += u.spin.x * pdt * 3;
+          g.rotation.y += u.spin.y * pdt * 3;
 
           if (g.position.distanceTo(PAD_POS) < 0.35 && u.velocity.length() > 1) {
             u.velocity.multiplyScalar(-0.4);
