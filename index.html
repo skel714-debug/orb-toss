@@ -306,6 +306,12 @@
       thrown: false,
       scored: false,
       charged: false,
+      carryVel: new THREE.Vector3(),
+      lastPos: mesh.position.clone(),
+      throwPos: new THREE.Vector3(),
+      hitOrb: false,
+      hitWall: false,
+      batted: false,
       trail, trailArr,
       bobPhase: Math.random() * Math.PI * 2,
       spin: new THREE.Vector3((Math.random() - 0.5), (Math.random() - 0.5), (Math.random() - 0.5)).multiplyScalar(0.8),
@@ -514,6 +520,7 @@
           tmpV.multiplyScalar(0.85);
           u.velocity.copy(tmpV).addScaledVector(tmpN, vn2);
           if (impact > 0.6) tone(95 + Math.random() * 40, 0.12, 'triangle', Math.min(0.45, impact * 0.06), null, 0, g.position);
+          u.hitWall = true;
           c.flash = 1;
           if (u.velocity.length() < 0.4) settleOrb(g);
         }
@@ -773,7 +780,8 @@
     p.ctx.clearRect(0, 0, 192, 64);
     p.ctx.textAlign = 'center';
     p.ctx.fillStyle = color;
-    p.ctx.font = '700 ' + (text.length > 4 ? 30 : 46) + 'px "Segoe UI", sans-serif';
+    const fs = text.length > 10 ? 24 : (text.length > 4 ? 30 : 46);
+    p.ctx.font = '700 ' + fs + 'px "Segoe UI", sans-serif';
     p.ctx.fillText(text, 96, 46);
     p.tex.needsUpdate = true;
     p.spr.position.copy(pos);
@@ -965,10 +973,26 @@
     streak++;
     let pts = Math.min(streak, 3) * (hoopGolden ? 2 : 1);
     if (power.kind === 'double') pts *= 2;
+
+    // Trick-shot bonuses — rewards for how the shot was made, not just that it landed
+    const u2 = g.userData;
+    const dist = u2.throwPos.lengthSq() > 0 ? hoop.position.distanceTo(u2.throwPos) : 0;
+    let bonus = 0, tag = '';
+    if (u2.hitWall) { bonus += 2; tag = 'BANK SHOT'; }
+    if (u2.hitOrb)  { bonus += 3; tag = u2.batted ? 'BAT SHOT' : 'CAROM'; }
+    if (dist > 4.5) { bonus += 2; if (!tag) tag = 'DEEP SHOT'; }
+    else if (dist > 3.0) { bonus += 1; if (!tag) tag = 'LONG SHOT'; }
+    pts += bonus;
+    if (tag) {
+      say(tag.toLowerCase().replace('shot', 'shot!'));
+      ensureAudio();
+      tone(1174, 0.1, 'sine', 0.28, null, 0.3);
+      tone(1568, 0.16, 'sine', 0.26, null, 0.4);
+    }
     if (mode === 'round') roundScore += pts; else freeScore += pts;
     const wasGolden = hoopGolden;
     const sp = hoop.position.clone();
-    spawnPopup('+' + pts, sp, wasGolden ? '#e8c76f' : '#7fe0b0');
+    spawnPopup(tag ? ('+' + pts + ' ' + tag) : ('+' + pts), sp, wasGolden ? '#e8c76f' : (tag ? '#e07fb0' : '#7fe0b0'));
     spawnBurst(sp, wasGolden ? 0xe8c76f : g.material.color.getHex());
     drawBoard();
     ensureAudio();
@@ -1006,64 +1030,103 @@
   const colN = new THREE.Vector3();
   const colRel = new THREE.Vector3();
 
+  function wakeOrb(orb, u, faint) {
+    if (u.free) return;
+    u.free = true;
+    u.thrown = false;
+    u.scored = false;
+    u.prevHoopZ = null;
+    u.hitWall = false;
+    u.throwPos.copy(orb.position);
+    u.trail.material.opacity = faint ? 0.3 : 0.45;
+    fillTrail(orb);
+    u.trail.visible = true;
+  }
+
+  function collisionFX(a, b, speed) {
+    if (speed <= 0.5) return;
+    ensureAudio();
+    tmpV.copy(a.position).add(b.position).multiplyScalar(0.5);
+    const f = 520 + Math.random() * 260;
+    tone(f, 0.07, 'triangle', Math.min(0.42, 0.1 + speed * 0.07), f * 0.55, 0, tmpV);
+    tone(f * 2.02, 0.05, 'sine', Math.min(0.2, speed * 0.04), null, 0.01, tmpV);
+    a.material.emissiveIntensity = Math.min(1.0, a.material.emissiveIntensity + speed * 0.25);
+    b.material.emissiveIntensity = Math.min(1.0, b.material.emissiveIntensity + speed * 0.25);
+    for (const c of controllers) if (speed > 1.2) pulse(c, Math.min(0.5, speed * 0.15), 30);
+  }
+
   function collideOrbs() {
     for (let i = 0; i < grabbables.length; i++) {
       const a = grabbables[i], ua = a.userData;
-      if (ua.heldBy) continue;                    // held orbs are immovable, and ignored
       for (let j = i + 1; j < grabbables.length; j++) {
         const b = grabbables[j], ub = b.userData;
-        if (ub.heldBy) continue;
-        if (!ua.free && !ub.free) continue;       // two idle orbs never interact
+
+        const aHeld = !!ua.heldBy, bHeld = !!ub.heldBy;
+        if (!aHeld && !bHeld && !ua.free && !ub.free) continue;  // two idle orbs never interact
 
         colN.copy(b.position).sub(a.position);
         const d = colN.length();
         if (d > COL_D || d < 1e-5) continue;
+        colN.divideScalar(d);
+        const overlap = COL_D - d;
 
-        colN.divideScalar(d);                     // unit normal, a -> b
+        if (aHeld && bHeld) {
+          // Two orbs held in two hands: clack, but neither leaves the grip
+          colRel.copy(ub.carryVel).sub(ua.carryVel);
+          collisionFX(a, b, Math.abs(colRel.dot(colN)));
+          continue;
+        }
+
+        if (aHeld || bHeld) {
+          // KINEMATIC BAT: the held orb has infinite mass and is unmoved.
+          // The other orb takes the whole impulse and is pushed fully clear.
+          const bat = aHeld ? a : b;
+          const ubat = aHeld ? ua : ub;
+          const tgt = aHeld ? b : a;
+          const utgt = aHeld ? ub : ua;
+          const n = aHeld ? 1 : -1;                 // outward direction from bat to target
+
+          tgt.position.addScaledVector(colN, overlap * n);
+          colRel.copy(utgt.velocity).sub(ubat.carryVel);
+          const approach = colRel.dot(colN) * n;
+          if (approach >= 0) continue;              // separating already
+
+          const speed = Math.abs(approach);
+          // Reflect the target's velocity about the contact normal, in the bat's frame
+          utgt.velocity.addScaledVector(colN, -(1 + COL_REST) * colRel.dot(colN));
+          // Carry a share of the swing's momentum into the struck orb
+          utgt.velocity.addScaledVector(ubat.carryVel, 0.55);
+          wakeOrb(tgt, utgt, false);
+          utgt.batted = true;
+          utgt.hitOrb = true;
+          utgt.spin.x += (Math.random() - 0.5) * speed * 0.6;
+          utgt.spin.y += (Math.random() - 0.5) * speed * 0.6;
+          utgt.spin.clampLength(0, 4);
+          collisionFX(a, b, speed);
+          continue;
+        }
+
+        // Both free-flying (or one idle): equal-mass elastic exchange
         colRel.copy(ub.velocity).sub(ua.velocity);
         const approach = colRel.dot(colN);
-
-        // Separate them so they don't stick together
-        const overlap = (COL_D - d) * 0.5;
-        a.position.addScaledVector(colN, -overlap);
-        b.position.addScaledVector(colN, overlap);
-
-        if (approach > 0) continue;                // already moving apart
+        a.position.addScaledVector(colN, -overlap * 0.5);
+        b.position.addScaledVector(colN, overlap * 0.5);
+        if (approach > 0) continue;
 
         const speed = Math.abs(approach);
-        // Equal masses: swap the normal components, scaled by restitution
         const impulse = -(1 + COL_REST) * approach * 0.5;
         ua.velocity.addScaledVector(colN, -impulse);
         ub.velocity.addScaledVector(colN, impulse);
 
-        // A struck idle orb wakes up and flies
-        for (const [orb, u] of [[a, ua], [b, ub]]) {
-          if (!u.free && u.velocity.lengthSq() > 0.04) {
-            u.free = true;
-            u.thrown = false;                      // knocked, not thrown: never breaks a streak
-            u.scored = false;
-            u.prevHoopZ = null;
-            u.trail.material.opacity = 0.3;
-            fillTrail(orb);
-            u.trail.visible = true;
-          }
-          // Impacts add spin — collisions should look like they transferred energy
+        for (const pair of [[a, ua], [b, ub]]) {
+          const orb = pair[0], u = pair[1];
+          if (!u.free && u.velocity.lengthSq() > 0.04) wakeOrb(orb, u, true);
+          u.hitOrb = true;
           u.spin.x += (Math.random() - 0.5) * speed * 0.5;
           u.spin.y += (Math.random() - 0.5) * speed * 0.5;
           u.spin.clampLength(0, 4);
         }
-
-        if (speed > 0.5) {
-          ensureAudio();
-          tmpV.copy(a.position).add(b.position).multiplyScalar(0.5);
-          // Bright glassy clack, pitched by impact force
-          const f = 520 + Math.random() * 260;
-          tone(f, 0.07, 'triangle', Math.min(0.42, 0.1 + speed * 0.07), f * 0.55, 0, tmpV);
-          tone(f * 2.02, 0.05, 'sine', Math.min(0.2, speed * 0.04), null, 0.01, tmpV);
-          a.material.emissiveIntensity = Math.min(1.0, a.material.emissiveIntensity + speed * 0.25);
-          b.material.emissiveIntensity = Math.min(1.0, b.material.emissiveIntensity + speed * 0.25);
-          for (const c of controllers) if (speed > 1.4) pulse(c, Math.min(0.35, speed * 0.12), 25);
-        }
+        collisionFX(a, b, speed);
       }
     }
   }
@@ -1133,6 +1196,11 @@
     held.userData.heldBy = null;
     held.userData.thrown = true;
     held.userData.scored = false;
+    held.userData.hitOrb = false;
+    held.userData.hitWall = false;
+    held.userData.batted = false;
+    held.userData.throwPos.copy(held.position);
+    held.userData.carryVel.set(0, 0, 0);
     held.material.emissiveIntensity = held.userData.baseEmissive;
     held.userData.trail.material.opacity = streak >= 3 ? 0.85 : 0.45;
     fillTrail(held);
@@ -2056,7 +2124,13 @@
           const forward = new THREE.Vector3(0, 0, (src && src.hand) ? -0.1 : -0.25).applyMatrix4(tmpMatrix);
           holdTarget.copy(wp).add(forward);
         }
-        ctrl.userData.held.position.lerp(holdTarget, Math.min(1, dt * 12));
+        const heldOrb = ctrl.userData.held;
+        heldOrb.userData.lastPos.copy(heldOrb.position);
+        heldOrb.position.lerp(holdTarget, Math.min(1, dt * 12));
+        if (dt > 0) {
+          tmpV.copy(heldOrb.position).sub(heldOrb.userData.lastPos).divideScalar(dt);
+          heldOrb.userData.carryVel.lerp(tmpV, 0.5);   // smoothed swing velocity
+        }
       }
     }
     padBox.material.emissiveIntensity = padHovered ? 0.9 : (0.3 + Math.sin(t * 2) * 0.1);
