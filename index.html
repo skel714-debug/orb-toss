@@ -833,13 +833,13 @@
   scene.add(kiosk);
 
   const pillar = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.05, 0.07, 1.0, 12),
+    new THREE.CylinderGeometry(0.05, 0.07, 0.60, 12),
     new THREE.MeshStandardMaterial({
       color: 0x123047, emissive: 0x2ea3b5, emissiveIntensity: 0.3,
       roughness: 0.5, metalness: 0.4
     })
   );
-  pillar.position.y = 0.5;
+  pillar.position.y = 0.30;   // tops out at 0.60 — clear of the EXIT panel at 0.73
   kiosk.add(pillar);
 
   const beacon = new THREE.Mesh(
@@ -863,12 +863,13 @@
       roughness: 0.4, metalness: 0.3
     })
   );
+  padBox.position.z = 0.12;
   billboard.add(padBox);
   const padLabel = new THREE.Mesh(
     new THREE.PlaneGeometry(0.6, 0.3),
     new THREE.MeshBasicMaterial({ map: padL.tex, transparent: true })
   );
-  padLabel.position.z = 0.055;
+  padLabel.position.set(0, 0, 0.175);
   billboard.add(padLabel);
 
   const exitBox = new THREE.Mesh(
@@ -878,13 +879,13 @@
       roughness: 0.4, metalness: 0.3
     })
   );
-  exitBox.position.y = -0.42;
+  exitBox.position.set(0, -0.42, 0.12);
   billboard.add(exitBox);
   const exitLabel = new THREE.Mesh(
     new THREE.PlaneGeometry(0.44, 0.165),
     new THREE.MeshBasicMaterial({ map: exitL.tex, transparent: true })
   );
-  exitLabel.position.set(0, -0.42, 0.05);
+  exitLabel.position.set(0, -0.42, 0.17);
   billboard.add(exitLabel);
 
   // ---------- Round control ----------
@@ -997,6 +998,74 @@
       drawBoard();
     }
     u.thrown = false;
+  }
+
+  // ---------- Orb-to-orb collision (equal-mass elastic, with restitution) ----------
+  const COL_D = ORB_R * 1.55;          // effective contact distance between two orbs
+  const COL_REST = 0.72;               // bounciness of orb-on-orb impacts
+  const colN = new THREE.Vector3();
+  const colRel = new THREE.Vector3();
+
+  function collideOrbs() {
+    for (let i = 0; i < grabbables.length; i++) {
+      const a = grabbables[i], ua = a.userData;
+      if (ua.heldBy) continue;                    // held orbs are immovable, and ignored
+      for (let j = i + 1; j < grabbables.length; j++) {
+        const b = grabbables[j], ub = b.userData;
+        if (ub.heldBy) continue;
+        if (!ua.free && !ub.free) continue;       // two idle orbs never interact
+
+        colN.copy(b.position).sub(a.position);
+        const d = colN.length();
+        if (d > COL_D || d < 1e-5) continue;
+
+        colN.divideScalar(d);                     // unit normal, a -> b
+        colRel.copy(ub.velocity).sub(ua.velocity);
+        const approach = colRel.dot(colN);
+
+        // Separate them so they don't stick together
+        const overlap = (COL_D - d) * 0.5;
+        a.position.addScaledVector(colN, -overlap);
+        b.position.addScaledVector(colN, overlap);
+
+        if (approach > 0) continue;                // already moving apart
+
+        const speed = Math.abs(approach);
+        // Equal masses: swap the normal components, scaled by restitution
+        const impulse = -(1 + COL_REST) * approach * 0.5;
+        ua.velocity.addScaledVector(colN, -impulse);
+        ub.velocity.addScaledVector(colN, impulse);
+
+        // A struck idle orb wakes up and flies
+        for (const [orb, u] of [[a, ua], [b, ub]]) {
+          if (!u.free && u.velocity.lengthSq() > 0.04) {
+            u.free = true;
+            u.thrown = false;                      // knocked, not thrown: never breaks a streak
+            u.scored = false;
+            u.prevHoopZ = null;
+            u.trail.material.opacity = 0.3;
+            fillTrail(orb);
+            u.trail.visible = true;
+          }
+          // Impacts add spin — collisions should look like they transferred energy
+          u.spin.x += (Math.random() - 0.5) * speed * 0.5;
+          u.spin.y += (Math.random() - 0.5) * speed * 0.5;
+          u.spin.clampLength(0, 4);
+        }
+
+        if (speed > 0.5) {
+          ensureAudio();
+          tmpV.copy(a.position).add(b.position).multiplyScalar(0.5);
+          // Bright glassy clack, pitched by impact force
+          const f = 520 + Math.random() * 260;
+          tone(f, 0.07, 'triangle', Math.min(0.42, 0.1 + speed * 0.07), f * 0.55, 0, tmpV);
+          tone(f * 2.02, 0.05, 'sine', Math.min(0.2, speed * 0.04), null, 0.01, tmpV);
+          a.material.emissiveIntensity = Math.min(1.0, a.material.emissiveIntensity + speed * 0.25);
+          b.material.emissiveIntensity = Math.min(1.0, b.material.emissiveIntensity + speed * 0.25);
+          for (const c of controllers) if (speed > 1.4) pulse(c, Math.min(0.35, speed * 0.12), 25);
+        }
+      }
+    }
   }
 
   // ---------- Controllers ----------
@@ -2053,11 +2122,16 @@
         u.prevHoopZ = null;
         const target = u.home.clone();
         target.y += Math.sin(t * 1.2 + u.bobPhase) * 0.06;
-        g.position.lerp(target, 0.02);
+        // Orbs recently knocked about drift home gently, not instantly
+        g.position.lerp(target, u.velocity.lengthSq() > 0.01 ? 0.005 : 0.02);
+        u.velocity.multiplyScalar(0.92);
         g.rotation.x += u.spin.x * dt;
         g.rotation.y += u.spin.y * dt;
+        u.spin.lerp(u.spin.clone().normalize().multiplyScalar(0.8), 0.01);
       }
     }
+
+    if (isAuthority()) collideOrbs();
 
     for (const p of popups) {
       if (p.life > 0) {
